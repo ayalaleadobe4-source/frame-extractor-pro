@@ -7,6 +7,7 @@ import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
 import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2 } from "lucide-react";
 import JSZip from "jszip";
+import * as MP4Box from "mp4box";
 
 interface VideoInfo {
   width: number;
@@ -42,10 +43,45 @@ const VideoFrameExtractor = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const getVideoFpsFromFile = async (file: File): Promise<{ fps: number; frameCount: number } | null> => {
+    return new Promise((resolve) => {
+      const mp4boxFile = MP4Box.createFile();
+      
+      mp4boxFile.onReady = (info) => {
+        const videoTrack = info.tracks.find((track) => track.type === "video");
+        if (videoTrack) {
+          const fps = videoTrack.nb_samples / (videoTrack.duration / videoTrack.timescale);
+          const frameCount = videoTrack.nb_samples;
+          resolve({ fps: Math.round(fps * 100) / 100, frameCount });
+        } else {
+          resolve(null);
+        }
+      };
+
+      mp4boxFile.onError = () => {
+        resolve(null);
+      };
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const buffer = reader.result as ArrayBuffer;
+        const mp4Buffer = buffer as MP4Box.MP4BoxBuffer;
+        mp4Buffer.fileStart = 0;
+        mp4boxFile.appendBuffer(mp4Buffer);
+        mp4boxFile.flush();
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsArrayBuffer(file);
+    });
+  };
+
   const analyzeVideo = useCallback(async (file: File) => {
     setIsAnalyzing(true);
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
+
+    // Try to get FPS from MP4Box first
+    const mp4Info = await getVideoFpsFromFile(file);
 
     return new Promise<VideoInfo>((resolve) => {
       const video = document.createElement("video");
@@ -56,22 +92,23 @@ const VideoFrameExtractor = () => {
         const duration = video.duration;
         const width = video.videoWidth;
         const height = video.videoHeight;
-        // Estimate frame rate - we'll use 30fps as default if not detectable
-        const estimatedFps = 30;
-        const frameCount = Math.floor(duration * estimatedFps);
+        
+        // Use detected FPS or fallback to estimation
+        const detectedFps = mp4Info?.fps || 30;
+        const frameCount = mp4Info?.frameCount || Math.floor(duration * detectedFps);
 
         const info: VideoInfo = {
           width,
           height,
           duration,
           frameCount,
-          frameRate: estimatedFps,
+          frameRate: detectedFps,
         };
 
         setVideoInfo(info);
         setSettings((prev) => ({
           ...prev,
-          fps: Math.min(prev.fps, estimatedFps),
+          fps: Math.min(prev.fps, Math.floor(detectedFps)),
         }));
         setIsAnalyzing(false);
         resolve(info);
