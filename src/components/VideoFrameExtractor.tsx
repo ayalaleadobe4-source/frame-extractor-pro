@@ -5,7 +5,7 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
-import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2 } from "lucide-react";
+import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap } from "lucide-react";
 import JSZip from "jszip";
 import * as MP4Box from "mp4box";
 
@@ -19,10 +19,12 @@ interface VideoInfo {
 
 interface ExtractionSettings {
   fps: number;
-  resolution: number; // percentage of original
-  quality: number; // 0-1
+  resolution: number;
+  quality: number;
   format: "png" | "jpeg" | "webp";
 }
+
+// Using mp4box types directly - cast as needed
 
 const VideoFrameExtractor = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -32,6 +34,8 @@ const VideoFrameExtractor = () => {
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionProgress, setExtractionProgress] = useState(0);
   const [extractedFrames, setExtractedFrames] = useState<Blob[]>([]);
+  const [useWebCodecs, setUseWebCodecs] = useState<boolean | null>(null);
+  const [extractionMethod, setExtractionMethod] = useState<string>("");
   const [settings, setSettings] = useState<ExtractionSettings>({
     fps: 1,
     resolution: 100,
@@ -42,17 +46,28 @@ const VideoFrameExtractor = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
-  const getVideoFpsFromFile = async (file: File): Promise<{ fps: number; frameCount: number } | null> => {
+  // Check WebCodecs support
+  const supportsWebCodecs = useCallback(() => {
+    return 'VideoDecoder' in window && 'EncodedVideoChunk' in window;
+  }, []);
+
+  const getVideoFpsFromFile = async (file: File): Promise<{ fps: number; frameCount: number; codec?: string; trackId?: number } | null> => {
     return new Promise((resolve) => {
       const mp4boxFile = MP4Box.createFile();
       
-      mp4boxFile.onReady = (info) => {
-        const videoTrack = info.tracks.find((track) => track.type === "video");
+      mp4boxFile.onReady = (info: MP4Box.Movie) => {
+        const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
         if (videoTrack) {
           const fps = videoTrack.nb_samples / (videoTrack.duration / videoTrack.timescale);
           const frameCount = videoTrack.nb_samples;
-          resolve({ fps: Math.round(fps * 100) / 100, frameCount });
+          resolve({ 
+            fps: Math.round(fps * 100) / 100, 
+            frameCount,
+            codec: videoTrack.codec,
+            trackId: videoTrack.id
+          });
         } else {
           resolve(null);
         }
@@ -75,79 +90,167 @@ const VideoFrameExtractor = () => {
     });
   };
 
-  const analyzeVideo = useCallback(async (file: File) => {
-    setIsAnalyzing(true);
-    const url = URL.createObjectURL(file);
-    setVideoUrl(url);
+  // WebCodecs-based fast extraction
+  const extractFramesWebCodecs = async (
+    file: File,
+    videoInfo: VideoInfo,
+    settings: ExtractionSettings,
+    onProgress: (progress: number) => void
+  ): Promise<Blob[]> => {
+    return new Promise((resolve, reject) => {
+      const frames: Blob[] = [];
+      const canvas = canvasRef.current!;
+      const ctx = canvas.getContext("2d")!;
 
-    // Try to get FPS from MP4Box first
-    const mp4Info = await getVideoFpsFromFile(file);
+      const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
+      const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
+      canvas.width = outputWidth;
+      canvas.height = outputHeight;
 
-    return new Promise<VideoInfo>((resolve) => {
-      const video = document.createElement("video");
-      video.preload = "metadata";
-      video.src = url;
+      const frameIntervalMicroseconds = (1000000 / settings.fps);
+      let lastExtractedTimestamp = -frameIntervalMicroseconds;
+      const targetFrameCount = Math.floor(videoInfo.duration * settings.fps);
+      let processedFrameCount = 0;
+      
+      const mimeType = `image/${settings.format}`;
+      const quality = settings.format === "png" ? undefined : settings.quality;
 
-      video.onloadedmetadata = () => {
-        const duration = video.duration;
-        const width = video.videoWidth;
-        const height = video.videoHeight;
+      const pendingBlobs: Promise<void>[] = [];
+      let decoderClosed = false;
+
+      const mp4boxFile = MP4Box.createFile();
+      let videoTrackId: number | null = null;
+      let codecConfig: VideoDecoderConfig | null = null;
+
+      const decoder = new VideoDecoder({
+        output: (frame: VideoFrame) => {
+          const timestamp = frame.timestamp;
+          
+          // Check if we should keep this frame based on target FPS
+          if (timestamp - lastExtractedTimestamp >= frameIntervalMicroseconds * 0.9) {
+            lastExtractedTimestamp = timestamp;
+            
+            ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
+            
+            const blobPromise = new Promise<void>((resolveBlob) => {
+              canvas.toBlob(
+                (blob) => {
+                  if (blob) {
+                    frames.push(blob);
+                    processedFrameCount++;
+                    onProgress((processedFrameCount / targetFrameCount) * 100);
+                  }
+                  resolveBlob();
+                },
+                mimeType,
+                quality
+              );
+            });
+            pendingBlobs.push(blobPromise);
+          }
+          
+          frame.close();
+        },
+        error: (e) => {
+          console.error("Decoder error:", e);
+          if (!decoderClosed) {
+            reject(e);
+          }
+        },
+      });
+
+      mp4boxFile.onReady = (info: MP4Box.Movie) => {
+        const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
+        if (!videoTrack) {
+          reject(new Error("No video track found"));
+          return;
+        }
+
+        videoTrackId = videoTrack.id;
         
-        // Use detected FPS or fallback to estimation
-        const detectedFps = mp4Info?.fps || 30;
-        const frameCount = mp4Info?.frameCount || Math.floor(duration * detectedFps);
-
-        const info: VideoInfo = {
-          width,
-          height,
-          duration,
-          frameCount,
-          frameRate: detectedFps,
+        // Build codec string for WebCodecs
+        const codecString = videoTrack.codec;
+        codecConfig = {
+          codec: codecString,
+          codedWidth: (videoTrack as { video?: { width: number; height: number } }).video?.width || videoInfo.width,
+          codedHeight: (videoTrack as { video?: { width: number; height: number } }).video?.height || videoInfo.height,
+          hardwareAcceleration: "prefer-hardware" as HardwareAcceleration,
         };
 
-        setVideoInfo(info);
-        setSettings((prev) => ({
-          ...prev,
-          fps: Math.min(prev.fps, Math.floor(detectedFps)),
-        }));
-        setIsAnalyzing(false);
-        resolve(info);
+        try {
+          decoder.configure(codecConfig);
+          mp4boxFile.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
+          mp4boxFile.start();
+        } catch (e) {
+          reject(e);
+        }
       };
+
+      mp4boxFile.onSamples = (_trackId: number, _user: unknown, samples: MP4Box.Sample[]) => {
+        for (const sample of samples) {
+          try {
+            const chunk = new EncodedVideoChunk({
+              type: sample.is_sync ? "key" : "delta",
+              timestamp: ((sample.cts || 0) / videoInfo.frameRate) * 1000000,
+              duration: ((sample.duration || 0) / videoInfo.frameRate) * 1000,
+              data: sample.data!,
+            });
+            decoder.decode(chunk);
+          } catch (e) {
+            console.error("Error decoding sample:", e);
+          }
+        }
+      };
+
+      mp4boxFile.onError = (_module: string, message: string) => {
+        console.error("MP4Box error:", message);
+        reject(new Error(message));
+      };
+
+      // Read file in chunks for better performance
+      const chunkSize = 1024 * 1024; // 1MB chunks
+      let offset = 0;
+
+      const readNextChunk = () => {
+        if (offset >= file.size) {
+          mp4boxFile.flush();
+          
+          // Wait for decoder to finish
+          decoder.flush().then(async () => {
+            decoderClosed = true;
+            decoder.close();
+            await Promise.all(pendingBlobs);
+            resolve(frames);
+          }).catch(reject);
+          return;
+        }
+
+        const slice = file.slice(offset, offset + chunkSize);
+        const reader = new FileReader();
+        
+        reader.onload = () => {
+          const buffer = reader.result as ArrayBuffer;
+          const mp4Buffer = buffer as MP4Box.MP4BoxBuffer;
+          mp4Buffer.fileStart = offset;
+          mp4boxFile.appendBuffer(mp4Buffer);
+          offset += chunkSize;
+          readNextChunk();
+        };
+        
+        reader.onerror = () => reject(new Error("Failed to read file"));
+        reader.readAsArrayBuffer(slice);
+      };
+
+      readNextChunk();
     });
-  }, []);
-
-  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file && file.type.startsWith("video/")) {
-      setVideoFile(file);
-      setExtractedFrames([]);
-      setExtractionProgress(0);
-      await analyzeVideo(file);
-    }
   };
 
-  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const file = event.dataTransfer.files[0];
-    if (file && file.type.startsWith("video/")) {
-      setVideoFile(file);
-      setExtractedFrames([]);
-      setExtractionProgress(0);
-      await analyzeVideo(file);
-    }
-  };
-
-  const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-  };
-
-  const extractFrames = async () => {
-    if (!videoFile || !videoInfo) return;
-
-    setIsExtracting(true);
-    setExtractedFrames([]);
-    setExtractionProgress(0);
-
+  // Fallback: Legacy seek-based extraction
+  const extractFramesLegacy = async (
+    videoInfo: VideoInfo,
+    settings: ExtractionSettings,
+    onProgress: (progress: number) => void
+  ): Promise<Blob[]> => {
     const video = videoRef.current!;
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext("2d")!;
@@ -185,11 +288,122 @@ const VideoFrameExtractor = () => {
       });
 
       frames.push(blob);
-      setExtractionProgress(((i + 1) / framesToExtract) * 100);
+      onProgress(((i + 1) / framesToExtract) * 100);
     }
 
-    setExtractedFrames(frames);
-    setIsExtracting(false);
+    return frames;
+  };
+
+  const analyzeVideo = useCallback(async (file: File) => {
+    setIsAnalyzing(true);
+    const url = URL.createObjectURL(file);
+    setVideoUrl(url);
+
+    // Check WebCodecs support
+    const webCodecsSupported = supportsWebCodecs();
+    setUseWebCodecs(webCodecsSupported);
+
+    // Try to get FPS from MP4Box first
+    const mp4Info = await getVideoFpsFromFile(file);
+
+    return new Promise<VideoInfo>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.src = url;
+
+      video.onloadedmetadata = () => {
+        const duration = video.duration;
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        
+        const detectedFps = mp4Info?.fps || 30;
+        const frameCount = mp4Info?.frameCount || Math.floor(duration * detectedFps);
+
+        const info: VideoInfo = {
+          width,
+          height,
+          duration,
+          frameCount,
+          frameRate: detectedFps,
+        };
+
+        setVideoInfo(info);
+        setSettings((prev) => ({
+          ...prev,
+          fps: Math.min(prev.fps, Math.floor(detectedFps)),
+        }));
+        setIsAnalyzing(false);
+        resolve(info);
+      };
+    });
+  }, [supportsWebCodecs]);
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file && file.type.startsWith("video/")) {
+      setVideoFile(file);
+      setExtractedFrames([]);
+      setExtractionProgress(0);
+      setExtractionMethod("");
+      await analyzeVideo(file);
+    }
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const file = event.dataTransfer.files[0];
+    if (file && file.type.startsWith("video/")) {
+      setVideoFile(file);
+      setExtractedFrames([]);
+      setExtractionProgress(0);
+      setExtractionMethod("");
+      await analyzeVideo(file);
+    }
+  };
+
+  const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+  };
+
+  const extractFrames = async () => {
+    if (!videoFile || !videoInfo) return;
+
+    setIsExtracting(true);
+    setExtractedFrames([]);
+    setExtractionProgress(0);
+
+    abortControllerRef.current = new AbortController();
+
+    const onProgress = (progress: number) => {
+      setExtractionProgress(Math.min(progress, 100));
+    };
+
+    try {
+      let frames: Blob[];
+      
+      // Try WebCodecs first for MP4 files
+      const isMp4 = videoFile.type === "video/mp4" || videoFile.name.toLowerCase().endsWith(".mp4");
+      
+      if (useWebCodecs && isMp4) {
+        setExtractionMethod("WebCodecs (GPU מואץ)");
+        try {
+          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress);
+        } catch (e) {
+          console.warn("WebCodecs extraction failed, falling back to legacy:", e);
+          setExtractionMethod("Legacy (CPU)");
+          frames = await extractFramesLegacy(videoInfo, settings, onProgress);
+        }
+      } else {
+        setExtractionMethod("Legacy (CPU)");
+        frames = await extractFramesLegacy(videoInfo, settings, onProgress);
+      }
+
+      setExtractedFrames(frames);
+    } catch (e) {
+      console.error("Extraction failed:", e);
+    } finally {
+      setIsExtracting(false);
+    }
   };
 
   const downloadAsZip = async () => {
@@ -232,6 +446,18 @@ const VideoFrameExtractor = () => {
           <p className="text-muted-foreground">
             העלה וידאו, בחר הגדרות והורד את כל הפריימים כקובץ ZIP
           </p>
+          {useWebCodecs !== null && (
+            <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm ${
+              useWebCodecs 
+                ? "bg-green-500/10 text-green-600 dark:text-green-400" 
+                : "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
+            }`}>
+              <Zap className="w-4 h-4" />
+              {useWebCodecs 
+                ? "WebCodecs זמין - חילוץ מהיר עם GPU" 
+                : "WebCodecs לא נתמך - שימוש בשיטה רגילה"}
+            </div>
+          )}
         </div>
 
         {/* Upload Zone */}
@@ -423,7 +649,14 @@ const VideoFrameExtractor = () => {
               {isExtracting && (
                 <div className="space-y-3">
                   <div className="flex justify-between items-center">
-                    <span className="text-sm font-medium">מחלץ פריימים...</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium">מחלץ פריימים...</span>
+                      {extractionMethod && (
+                        <span className="text-xs px-2 py-0.5 bg-primary/10 text-primary rounded-full">
+                          {extractionMethod}
+                        </span>
+                      )}
+                    </div>
                     <span className="text-sm text-muted-foreground">
                       {Math.round(extractionProgress)}%
                     </span>
@@ -441,6 +674,7 @@ const VideoFrameExtractor = () => {
                     </p>
                     <p className="text-sm text-muted-foreground">
                       מוכן להורדה כקובץ ZIP
+                      {extractionMethod && ` • שיטה: ${extractionMethod}`}
                     </p>
                   </div>
                 </div>
@@ -462,6 +696,9 @@ const VideoFrameExtractor = () => {
                     <>
                       <Film className="w-4 h-4 mr-2" />
                       התחל חילוץ
+                      {useWebCodecs && (
+                        <Zap className="w-4 h-4 mr-1 text-primary" />
+                      )}
                     </>
                   )}
                 </Button>
@@ -487,7 +724,8 @@ const VideoFrameExtractor = () => {
           ref={videoRef}
           src={videoUrl}
           className="hidden"
-          crossOrigin="anonymous"
+          playsInline
+          muted
         />
         <canvas ref={canvasRef} className="hidden" />
       </div>
