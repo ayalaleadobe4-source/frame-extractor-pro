@@ -65,7 +65,7 @@ const VideoFrameExtractor = () => {
           resolve({ 
             fps: Math.round(fps * 100) / 100, 
             frameCount,
-            codec: videoTrack.codec,
+            codec: videoTrack.code,
             trackId: videoTrack.id
           });
         } else {
