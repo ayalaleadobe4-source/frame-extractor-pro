@@ -1,572 +1,734 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
-import { Upload, Download, Film, Loader2, Zap, AlertTriangle, Trash2 } from "lucide-react";
+import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap } from "lucide-react";
 import JSZip from "jszip";
 import * as MP4Box from "mp4box";
 
 interface VideoInfo {
   width: number;
   height: number;
-  duration: number;     // שניות
+  duration: number;
   frameCount: number;
-  frameRate: number;    // fps מדויק
-  codec?: string;
+  frameRate: number;
 }
 
 interface ExtractionSettings {
   fps: number;
-  resolution: number;   // 20–100%
-  quality: number;      // 0.1–1
+  resolution: number;
+  quality: number;
   format: "png" | "jpeg" | "webp";
 }
 
-const MAX_FRAMES_LIMIT = 3500;
-const BYTES_PER_PIXEL = 4; // RGBA
+// Using mp4box types directly - cast as needed
 
 const VideoFrameExtractor = () => {
-  const [videoFile, setVideoFile]         = useState<File | null>(null);
-  const [videoUrl, setVideoUrl]           = useState("");
-  const [videoInfo, setVideoInfo]         = useState<VideoInfo | null>(null);
-  const [isAnalyzing, setIsAnalyzing]     = useState(false);
-  const [isExtracting, setIsExtracting]   = useState(false);
-  const [progress, setProgress]           = useState(0);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string>("");
+  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [extractionProgress, setExtractionProgress] = useState(0);
   const [extractedFrames, setExtractedFrames] = useState<Blob[]>([]);
-  const [previewUrls, setPreviewUrls]     = useState<string[]>([]);
-  const [errorMsg, setErrorMsg]           = useState<string | null>(null);
-  const [abortCtrl, setAbortCtrl]         = useState<AbortController | null>(null);
-
+  const [useWebCodecs, setUseWebCodecs] = useState<boolean | null>(null);
+  const [extractionMethod, setExtractionMethod] = useState<string>("");
   const [settings, setSettings] = useState<ExtractionSettings>({
     fps: 1,
-    resolution: 85,
-    quality: 0.88,
-    format: "webp",
+    resolution: 100,
+    quality: 0.9,
+    format: "png",
   });
-
-  const [method, setMethod] = useState<"webcodecs" | "canvas">("webcodecs");
-
-  const videoRef  = useRef<HTMLVideoElement>(null);
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
-  const supportsWebCodecs = useMemo(
-    () => typeof VideoDecoder !== "undefined" && typeof EncodedVideoChunk !== "undefined",
-    []
-  );
-
-  // ─── ניתוח וידאו עם MP4Box ───
-  const analyzeVideo = useCallback(async (file: File): Promise<VideoInfo> => {
-    return new Promise((resolve, reject) => {
-      const mp4box = MP4Box.createFile();
-      mp4box.onError = (err: string) => reject(new Error(`MP4Box error: ${err}`));
-
-      mp4box.onReady = (info: any) => {
-        const vt = info.videoTracks?.[0];
-        if (!vt) {
-          reject(new Error("לא נמצאה מסלול וידאו"));
-          return;
-        }
-
-        const durationSec = vt.duration / vt.timescale;
-        const fps = vt.nb_samples / durationSec || 30;
-
-        resolve({
-          width: vt.track_width || 0,
-          height: vt.track_height || 0,
-          duration: durationSec,
-          frameCount: vt.nb_samples,
-          frameRate: Math.round(fps * 100) / 100,
-          codec: vt.codec,
-        });
-      };
-
-      const chunk = file.slice(0, 6 * 1024 * 1024); // 6MB – בדרך כלל מספיק ל-moov
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const ab = e.target?.result as ArrayBuffer;
-        (ab as any).fileStart = 0;
-        mp4box.appendBuffer(ab);
-        mp4box.flush();
-      };
-      reader.onerror = () => reject(new Error("שגיאת קריאת קובץ"));
-      reader.readAsArrayBuffer(chunk);
-    });
+  // Check WebCodecs support
+  const supportsWebCodecs = useCallback(() => {
+    return 'VideoDecoder' in window && 'EncodedVideoChunk' in window;
   }, []);
 
-  const estimatedMemoryMB = useMemo(() => {
-    if (!videoInfo) return 0;
-    const count = Math.min(MAX_FRAMES_LIMIT, Math.floor(videoInfo.duration * settings.fps));
-    const scale = settings.resolution / 100;
-    const bytes = count * Math.round(videoInfo.width * scale) * Math.round(videoInfo.height * scale) * BYTES_PER_PIXEL;
-    return Math.round(bytes / 1024 / 1024 * 1.4); // overhead
-  }, [videoInfo, settings.fps, settings.resolution]);
-
-  // ─── WebCodecs + MP4Box demuxer ───
-  const extractWebCodecs = async (
-    file: File,
-    info: VideoInfo,
-    cfg: ExtractionSettings,
-    onProgress: (p: number) => void,
-    signal: AbortSignal
-  ): Promise<Blob[]> => {
-    const frames: Blob[] = [];
-    let processed = 0;
-    const targetInterval = 1 / cfg.fps;
-    let nextTargetTime = targetInterval / 2; // מתחילים קצת אחרי 0
-
-    const mp4box = MP4Box.createFile();
-    mp4box.onError = (e: string) => { throw new Error(`MP4Box: ${e}`); };
-
-    const decoder = new VideoDecoder({
-      output: async (frame: VideoFrame) => {
-        if (signal.aborted) {
-          frame.close();
-          return;
-        }
-
-        const t = frame.timestamp / 1_000_000;
-        if (t >= nextTargetTime) {
-          const canvas = document.createElement("canvas");
-          const w = frame.visibleRect?.width  || frame.codedWidth;
-          const h = frame.visibleRect?.height || frame.codedHeight;
-          const scale = cfg.resolution / 100;
-
-          canvas.width  = Math.round(w * scale);
-          canvas.height = Math.round(h * scale);
-
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-            const blob = await new Promise<Blob | null>((r) =>
-              canvas.toBlob((b) => r(b), `image/${cfg.format}`, cfg.quality)
-            );
-            if (blob) {
-              frames.push(blob);
-              processed++;
-              onProgress((processed / Math.ceil(info.duration * cfg.fps)) * 100);
-            }
-          }
-          nextTargetTime += targetInterval;
-        }
-        frame.close();
-      },
-      error: (e) => console.error("VideoDecoder error:", e),
-    });
-
-    return new Promise<Blob[]>((resolve, reject) => {
-      mp4box.onReady = async (info: any) => {
-        const track = info.videoTracks[0];
-        if (!track) return reject(new Error("No video track"));
-
-        try {
-          decoder.configure({
-            codec: track.codec,
-            codedWidth: track.track_width,
-            codedHeight: track.track_height,
-            description: track.avcC || track.hevcC || track.vvcC || undefined,
+  const getVideoFpsFromFile = async (file: File): Promise<{ fps: number; frameCount: number; codec?: string; trackId?: number } | null> => {
+    return new Promise((resolve) => {
+      const mp4boxFile = MP4Box.createFile();
+      
+      mp4boxFile.onReady = (info: MP4Box.Movie) => {
+        const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
+        if (videoTrack) {
+          const fps = videoTrack.nb_samples / (videoTrack.duration / videoTrack.timescale);
+          const frameCount = videoTrack.nb_samples;
+          resolve({ 
+            fps: Math.round(fps * 100) / 100, 
+            frameCount,
+            codec: videoTrack.codec,
+            trackId: videoTrack.id
           });
-        } catch (err) {
-          reject(new Error(`Decoder configure failed: ${err}`));
-          return;
+        } else {
+          resolve(null);
         }
       };
 
-      mp4box.setExtractionOptions(1, null, { nbSamples: Infinity });
-      mp4box.start();
+      mp4boxFile.onError = () => {
+        resolve(null);
+      };
 
-      file.arrayBuffer()
-        .then((ab) => {
-          (ab as any).fileStart = 0;
-          mp4box.appendBuffer(ab);
-          mp4box.flush();
-        })
-        .catch(reject);
-
-      const checkDone = setInterval(() => {
-        if (signal.aborted) {
-          clearInterval(checkDone);
-          reject(new DOMException("Aborted", "AbortError"));
-        }
-        if (processed >= Math.ceil(info.duration * cfg.fps) || nextTargetTime > info.duration + 1) {
-          clearInterval(checkDone);
-          resolve(frames);
-        }
-      }, 400);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const buffer = reader.result as ArrayBuffer;
+        const mp4Buffer = buffer as MP4Box.MP4BoxBuffer;
+        mp4Buffer.fileStart = 0;
+        mp4boxFile.appendBuffer(mp4Buffer);
+        mp4boxFile.flush();
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsArrayBuffer(file);
     });
   };
 
-  // ─── Legacy Canvas fallback ───
-  const extractCanvas = async (
-    info: VideoInfo,
-    cfg: ExtractionSettings,
-    onProgress: (p: number) => void,
-    signal: AbortSignal
+  // WebCodecs-based fast extraction
+  const extractFramesWebCodecs = async (
+    file: File,
+    videoInfo: VideoInfo,
+    settings: ExtractionSettings,
+    onProgress: (progress: number) => void
   ): Promise<Blob[]> => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) throw new Error("Refs חסרים");
+    return new Promise((resolve, reject) => {
+      const frames: Blob[] = [];
+      const canvas = canvasRef.current!;
+      const ctx = canvas.getContext("2d")!;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Canvas 2D context חסר");
+      const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
+      const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
+      canvas.width = outputWidth;
+      canvas.height = outputHeight;
 
-    const frames: Blob[] = [];
-    const step = 1 / cfg.fps;
-    let time = 0;
+      const frameIntervalMicroseconds = (1000000 / settings.fps);
+      let lastExtractedTimestamp = -frameIntervalMicroseconds;
+      const targetFrameCount = Math.floor(videoInfo.duration * settings.fps);
+      let processedFrameCount = 0;
+      
+      const mimeType = `image/${settings.format}`;
+      const quality = settings.format === "png" ? undefined : settings.quality;
 
-    canvas.width  = Math.round(info.width  * (cfg.resolution / 100));
-    canvas.height = Math.round(info.height * (cfg.resolution / 100));
+      const pendingBlobs: Promise<void>[] = [];
+      let decoderClosed = false;
 
-    while (time <= info.duration + 0.1 && !signal.aborted) {
-      video.currentTime = time;
+      const mp4boxFile = MP4Box.createFile();
+      let videoTrackId: number | null = null;
+      let codecConfig: VideoDecoderConfig | null = null;
 
-      await new Promise<void>((res) => {
-        const onSeeked = () => {
-          video.removeEventListener("seeked", onSeeked);
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          canvas.toBlob(
-            (blob) => {
-              if (blob) frames.push(blob);
-              res();
-            },
-            `image/${cfg.format}`,
-            cfg.quality
-          );
-        };
-        video.addEventListener("seeked", onSeeked, { once: true });
-        video.addEventListener("error", () => res(), { once: true });
+      const decoder = new VideoDecoder({
+        output: (frame: VideoFrame) => {
+          const timestamp = frame.timestamp;
+          
+          // Check if we should keep this frame based on target FPS
+          if (timestamp - lastExtractedTimestamp >= frameIntervalMicroseconds * 0.9) {
+            lastExtractedTimestamp = timestamp;
+            
+            ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
+            
+            const blobPromise = new Promise<void>((resolveBlob) => {
+              canvas.toBlob(
+                (blob) => {
+                  if (blob) {
+                    frames.push(blob);
+                    processedFrameCount++;
+                    onProgress((processedFrameCount / targetFrameCount) * 100);
+                  }
+                  resolveBlob();
+                },
+                mimeType,
+                quality
+              );
+            });
+            pendingBlobs.push(blobPromise);
+          }
+          
+          frame.close();
+        },
+        error: (e) => {
+          console.error("Decoder error:", e);
+          if (!decoderClosed) {
+            reject(e);
+          }
+        },
       });
 
-      time += step;
-      onProgress((time / (info.duration + 0.1)) * 100);
+      mp4boxFile.onReady = (info: MP4Box.Movie) => {
+        const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
+        if (!videoTrack) {
+          reject(new Error("No video track found"));
+          return;
+        }
+
+        videoTrackId = videoTrack.id;
+        
+        // Build codec string for WebCodecs
+        const codecString = videoTrack.codec;
+        codecConfig = {
+          codec: codecString,
+          codedWidth: (videoTrack as { video?: { width: number; height: number } }).video?.width || videoInfo.width,
+          codedHeight: (videoTrack as { video?: { width: number; height: number } }).video?.height || videoInfo.height,
+          hardwareAcceleration: "prefer-hardware" as HardwareAcceleration,
+        };
+
+        try {
+          decoder.configure(codecConfig);
+          mp4boxFile.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
+          mp4boxFile.start();
+        } catch (e) {
+          reject(e);
+        }
+      };
+
+      mp4boxFile.onSamples = (_trackId: number, _user: unknown, samples: MP4Box.Sample[]) => {
+        for (const sample of samples) {
+          try {
+            const chunk = new EncodedVideoChunk({
+              type: sample.is_sync ? "key" : "delta",
+              timestamp: ((sample.cts || 0) / videoInfo.frameRate) * 1000000,
+              duration: ((sample.duration || 0) / videoInfo.frameRate) * 1000,
+              data: sample.data!,
+            });
+            decoder.decode(chunk);
+          } catch (e) {
+            console.error("Error decoding sample:", e);
+          }
+        }
+      };
+
+      mp4boxFile.onError = (_module: string, message: string) => {
+        console.error("MP4Box error:", message);
+        reject(new Error(message));
+      };
+
+      // Read file in chunks for better performance
+      const chunkSize = 1024 * 1024; // 1MB chunks
+      let offset = 0;
+
+      const readNextChunk = () => {
+        if (offset >= file.size) {
+          mp4boxFile.flush();
+          
+          // Wait for decoder to finish
+          decoder.flush().then(async () => {
+            decoderClosed = true;
+            decoder.close();
+            await Promise.all(pendingBlobs);
+            resolve(frames);
+          }).catch(reject);
+          return;
+        }
+
+        const slice = file.slice(offset, offset + chunkSize);
+        const reader = new FileReader();
+        
+        reader.onload = () => {
+          const buffer = reader.result as ArrayBuffer;
+          const mp4Buffer = buffer as MP4Box.MP4BoxBuffer;
+          mp4Buffer.fileStart = offset;
+          mp4boxFile.appendBuffer(mp4Buffer);
+          offset += chunkSize;
+          readNextChunk();
+        };
+        
+        reader.onerror = () => reject(new Error("Failed to read file"));
+        reader.readAsArrayBuffer(slice);
+      };
+
+      readNextChunk();
+    });
+  };
+
+  // Fallback: Legacy seek-based extraction
+  const extractFramesLegacy = async (
+    videoInfo: VideoInfo,
+    settings: ExtractionSettings,
+    onProgress: (progress: number) => void
+  ): Promise<Blob[]> => {
+    const video = videoRef.current!;
+    const canvas = canvasRef.current!;
+    const ctx = canvas.getContext("2d")!;
+
+    const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
+    const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
+    canvas.width = outputWidth;
+    canvas.height = outputHeight;
+
+    const framesToExtract = Math.floor(videoInfo.duration * settings.fps);
+    const frameInterval = 1 / settings.fps;
+    const frames: Blob[] = [];
+
+    video.currentTime = 0;
+
+    for (let i = 0; i < framesToExtract; i++) {
+      const targetTime = i * frameInterval;
+      
+      await new Promise<void>((resolve) => {
+        video.currentTime = targetTime;
+        video.onseeked = () => resolve();
+      });
+
+      ctx.drawImage(video, 0, 0, outputWidth, outputHeight);
+
+      const mimeType = `image/${settings.format}`;
+      const quality = settings.format === "png" ? undefined : settings.quality;
+
+      const blob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob(
+          (blob) => resolve(blob!),
+          mimeType,
+          quality
+        );
+      });
+
+      frames.push(blob);
+      onProgress(((i + 1) / framesToExtract) * 100);
     }
 
     return frames;
   };
 
-  const startExtraction = async () => {
+  const analyzeVideo = useCallback(async (file: File) => {
+    setIsAnalyzing(true);
+    const url = URL.createObjectURL(file);
+    setVideoUrl(url);
+
+    // Check WebCodecs support
+    const webCodecsSupported = supportsWebCodecs();
+    setUseWebCodecs(webCodecsSupported);
+
+    // Try to get FPS from MP4Box first
+    const mp4Info = await getVideoFpsFromFile(file);
+
+    return new Promise<VideoInfo>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.src = url;
+
+      video.onloadedmetadata = () => {
+        const duration = video.duration;
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        
+        const detectedFps = mp4Info?.fps || 30;
+        const frameCount = mp4Info?.frameCount || Math.floor(duration * detectedFps);
+
+        const info: VideoInfo = {
+          width,
+          height,
+          duration,
+          frameCount,
+          frameRate: detectedFps,
+        };
+
+        setVideoInfo(info);
+        setSettings((prev) => ({
+          ...prev,
+          fps: Math.min(prev.fps, Math.floor(detectedFps)),
+        }));
+        setIsAnalyzing(false);
+        resolve(info);
+      };
+    });
+  }, [supportsWebCodecs]);
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file && file.type.startsWith("video/")) {
+      setVideoFile(file);
+      setExtractedFrames([]);
+      setExtractionProgress(0);
+      setExtractionMethod("");
+      await analyzeVideo(file);
+    }
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const file = event.dataTransfer.files[0];
+    if (file && file.type.startsWith("video/")) {
+      setVideoFile(file);
+      setExtractedFrames([]);
+      setExtractionProgress(0);
+      setExtractionMethod("");
+      await analyzeVideo(file);
+    }
+  };
+
+  const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+  };
+
+  const extractFrames = async () => {
     if (!videoFile || !videoInfo) return;
 
-    if (estimatedMemoryMB > 1400) {
-      if (!confirm(`צפוי שימוש של כ-${estimatedMemoryMB} MB זיכרון.\nזה עלול להאט או לקרוס את הדפדפן. להמשיך?`)) {
-        return;
-      }
-    }
-
-    const controller = new AbortController();
-    setAbortCtrl(controller);
     setIsExtracting(true);
     setExtractedFrames([]);
-    setPreviewUrls([]);
-    setProgress(0);
-    setErrorMsg(null);
+    setExtractionProgress(0);
+
+    abortControllerRef.current = new AbortController();
+
+    const onProgress = (progress: number) => {
+      setExtractionProgress(Math.min(progress, 100));
+    };
 
     try {
-      let frames: Blob[] = [];
-
-      if (method === "webcodecs" && supportsWebCodecs) {
-        frames = await extractWebCodecs(videoFile, videoInfo, settings, setProgress, controller.signal);
+      let frames: Blob[];
+      
+      // Try WebCodecs first for MP4 files
+      const isMp4 = videoFile.type === "video/mp4" || videoFile.name.toLowerCase().endsWith(".mp4");
+      
+      if (useWebCodecs && isMp4) {
+        setExtractionMethod("WebCodecs (GPU מואץ)");
+        try {
+          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress);
+        } catch (e) {
+          console.warn("WebCodecs extraction failed, falling back to legacy:", e);
+          setExtractionMethod("Legacy (CPU)");
+          frames = await extractFramesLegacy(videoInfo, settings, onProgress);
+        }
       } else {
-        frames = await extractCanvas(videoInfo, settings, setProgress, controller.signal);
-      }
-
-      if (frames.length > MAX_FRAMES_LIMIT) {
-        frames = frames.slice(0, MAX_FRAMES_LIMIT);
-        setErrorMsg(`הוגבל ל-${MAX_FRAMES_LIMIT} תמונות מטעמי זיכרון`);
+        setExtractionMethod("Legacy (CPU)");
+        frames = await extractFramesLegacy(videoInfo, settings, onProgress);
       }
 
       setExtractedFrames(frames);
-
-      // תצוגה מקדימה – רק 6–10 תמונות
-      const previews = await Promise.all(
-        frames.slice(0, 9).map((b) => URL.createObjectURL(b))
-      );
-      setPreviewUrls(previews);
-    } catch (err: any) {
-      if (err.name === "AbortError") {
-        setErrorMsg("החילוץ בוטל על ידך");
-      } else {
-        setErrorMsg(err.message || "שגיאה בחילוץ הפריימים");
-      }
+    } catch (e) {
+      console.error("Extraction failed:", e);
     } finally {
       setIsExtracting(false);
-      setAbortCtrl(null);
     }
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file?.type.startsWith("video/")) return;
-
-    setVideoFile(file);
-    setVideoUrl(URL.createObjectURL(file));
-    setExtractedFrames([]);
-    setPreviewUrls([]);
-    setErrorMsg(null);
-    setVideoInfo(null);
-
-    setIsAnalyzing(true);
-    try {
-      const info = await analyzeVideo(file);
-      setVideoInfo(info);
-    } catch (err: any) {
-      setErrorMsg(`ניתוח הווידאו נכשל: ${err.message}`);
-    } finally {
-      setIsAnalyzing(false);
-    }
-  };
-
-  const downloadZip = async () => {
-    if (!extractedFrames.length) return;
+  const downloadAsZip = async () => {
+    if (extractedFrames.length === 0) return;
 
     const zip = new JSZip();
-    extractedFrames.forEach((blob, i) => {
-      zip.file(`frame_${(i + 1).toString().padStart(5, "0")}.${settings.format}`, blob);
+    const folder = zip.folder("frames");
+
+    extractedFrames.forEach((blob, index) => {
+      const paddedIndex = String(index + 1).padStart(5, "0");
+      folder?.file(`frame_${paddedIndex}.${settings.format}`, blob);
     });
 
-    const blob = await zip.generateAsync({ type: "blob" });
-    const url = URL.createObjectURL(blob);
+    const content = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(content);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `frames_${new Date().toISOString().slice(0,16).replace(/[:T]/g,"-")}.zip`;
+    a.download = `frames_${videoFile?.name.split(".")[0] || "video"}.zip`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  useEffect(() => {
-    return () => {
-      previewUrls.forEach(URL.revokeObjectURL);
-    };
-  }, [previewUrls]);
+  const formatDuration = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  };
+
+  const estimatedFrames = videoInfo
+    ? Math.floor(videoInfo.duration * settings.fps)
+    : 0;
 
   return (
-    <div className="container mx-auto p-5 max-w-5xl">
-      <h1 className="text-3xl font-bold mb-8 text-center">מחלץ פריימים מווידאו</h1>
-
-      {errorMsg && (
-        <div className="bg-red-50 border border-red-300 text-red-800 px-5 py-4 rounded-lg mb-8 flex items-center gap-3">
-          <AlertTriangle className="h-5 w-5 flex-shrink-0" />
-          <div>{errorMsg}</div>
-        </div>
-      )}
-
-      {/* העלאה */}
-      <Card className="p-10 mb-10 border-2 border-dashed hover:border-primary/50 transition-colors">
-        <input
-          type="file"
-          accept="video/mp4,video/webm,video/quicktime,mov"
-          ref={fileInputRef}
-          onChange={handleFileChange}
-          className="hidden"
-        />
-        <div className="text-center">
-          <Button
-            size="lg"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isAnalyzing || isExtracting}
-          >
-            <Upload className="mr-2 h-5 w-5" />
-            בחר וידאו (או גרור לכאן)
-          </Button>
-          <p className="mt-4 text-sm text-muted-foreground">
-            mp4 • webm • mov — עדיף קבצים עם moov בראש (faststart)
+    <div className="min-h-screen bg-background p-4 md:p-8">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <div className="text-center space-y-2">
+          <h1 className="text-3xl md:text-4xl font-bold text-foreground">
+            מחלץ פריימים מווידאו
+          </h1>
+          <p className="text-muted-foreground">
+            העלה וידאו, בחר הגדרות והורד את כל הפריימים כקובץ ZIP
           </p>
+          {useWebCodecs !== null && (
+            <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm ${
+              useWebCodecs 
+                ? "bg-green-500/10 text-green-600 dark:text-green-400" 
+                : "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
+            }`}>
+              <Zap className="w-4 h-4" />
+              {useWebCodecs 
+                ? "WebCodecs זמין - חילוץ מהיר עם GPU" 
+                : "WebCodecs לא נתמך - שימוש בשיטה רגילה"}
+            </div>
+          )}
         </div>
 
-        {videoUrl && (
-          <video
-            src={videoUrl}
-            controls
-            className="mt-8 max-h-80 mx-auto rounded-lg shadow-md"
+        {/* Upload Zone */}
+        <Card
+          className={`upload-zone p-8 border-2 border-dashed transition-all cursor-pointer ${
+            videoFile ? "border-primary/50 bg-primary/5" : "border-border hover:border-primary/30"
+          }`}
+          onClick={() => fileInputRef.current?.click()}
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            onChange={handleFileSelect}
+            className="hidden"
           />
-        )}
-      </Card>
+          <div className="flex flex-col items-center justify-center gap-4">
+            {isAnalyzing ? (
+              <>
+                <Loader2 className="w-12 h-12 text-primary animate-spin" />
+                <p className="text-muted-foreground">מנתח את הווידאו...</p>
+              </>
+            ) : videoFile ? (
+              <>
+                <Film className="w-12 h-12 text-primary" />
+                <div className="text-center">
+                  <p className="font-medium text-foreground">{videoFile.name}</p>
+                  <p className="text-sm text-muted-foreground">
+                    לחץ להחלפת קובץ
+                  </p>
+                </div>
+              </>
+            ) : (
+              <>
+                <Upload className="w-12 h-12 text-muted-foreground" />
+                <div className="text-center">
+                  <p className="font-medium text-foreground">
+                    גרור ושחרר וידאו כאן
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    או לחץ לבחירת קובץ
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+        </Card>
 
-      {videoInfo && (
-        <>
-          {/* מידע על הווידאו */}
-          <Card className="p-6 mb-8">
-            <h2 className="text-xl font-semibold mb-5">פרטי הווידאו</h2>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-5 text-sm">
-              <div>
-                <div className="text-muted-foreground">רזולוציה</div>
-                {videoInfo.width} × {videoInfo.height}
+        {/* Video Info */}
+        {videoInfo && (
+          <Card className="p-6 video-info-card">
+            <div className="flex items-center gap-2 mb-4">
+              <Film className="w-5 h-5 text-primary" />
+              <h2 className="font-semibold text-lg">מידע על הווידאו</h2>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="info-stat">
+                <p className="text-sm text-muted-foreground">רזולוציה</p>
+                <p className="font-bold text-xl">
+                  {videoInfo.width}×{videoInfo.height}
+                </p>
               </div>
-              <div>
-                <div className="text-muted-foreground">אורך</div>
-                {videoInfo.duration.toFixed(1)} שניות
+              <div className="info-stat">
+                <p className="text-sm text-muted-foreground">משך</p>
+                <p className="font-bold text-xl">
+                  {formatDuration(videoInfo.duration)}
+                </p>
               </div>
-              <div>
-                <div className="text-muted-foreground">קצב פריימים</div>
-                {videoInfo.frameRate.toFixed(3)} fps
+              <div className="info-stat">
+                <p className="text-sm text-muted-foreground">קצב פריימים</p>
+                <p className="font-bold text-xl">{videoInfo.frameRate} FPS</p>
               </div>
-              <div>
-                <div className="text-muted-foreground">פריימים צפויים</div>
-                {Math.floor(videoInfo.duration * settings.fps)}
+              <div className="info-stat">
+                <p className="text-sm text-muted-foreground">סה״כ פריימים (משוער)</p>
+                <p className="font-bold text-xl text-primary">
+                  {videoInfo.frameCount.toLocaleString()}
+                </p>
               </div>
             </div>
-
-            {estimatedMemoryMB > 0 && (
-              <p className="mt-5 text-sm text-amber-700">
-                הערכת זיכרון: ≈ {estimatedMemoryMB} MB
-              </p>
-            )}
           </Card>
+        )}
 
-          {/* הגדרות */}
-          <Card className="p-6 mb-8">
-            <h2 className="text-xl font-semibold mb-6">הגדרות חילוץ</h2>
-
-            <div className="grid gap-7 md:grid-cols-3">
-              <div>
-                <Label className="mb-1.5 block">קצב (fps)</Label>
+        {/* Settings */}
+        {videoInfo && (
+          <Card className="p-6 settings-card">
+            <div className="flex items-center gap-2 mb-6">
+              <Settings className="w-5 h-5 text-primary" />
+              <h2 className="font-semibold text-lg">הגדרות חילוץ</h2>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* FPS */}
+              <div className="space-y-3">
+                <div className="flex justify-between items-center">
+                  <Label>פריימים לשנייה (FPS)</Label>
+                  <span className="text-sm font-mono bg-muted px-2 py-1 rounded">
+                    {settings.fps} FPS
+                  </span>
+                </div>
                 <Slider
                   value={[settings.fps]}
-                  onValueChange={([v]) => setSettings((s) => ({ ...s, fps: v }))}
-                  min={0.2}
-                  max={10}
-                  step={0.1}
+                  onValueChange={([value]) =>
+                    setSettings((prev) => ({ ...prev, fps: value }))
+                  }
+                  min={1}
+                  max={Math.min(30, videoInfo.frameRate)}
+                  step={1}
+                  className="settings-slider"
                 />
-                <div className="text-sm mt-1.5">{settings.fps} fps</div>
+                <p className="text-xs text-muted-foreground">
+                  יחולצו כ-{estimatedFrames} פריימים
+                </p>
               </div>
 
-              <div>
-                <Label className="mb-1.5 block">רזולוציה (%)</Label>
+              {/* Resolution */}
+              <div className="space-y-3">
+                <div className="flex justify-between items-center">
+                  <Label>רזולוציה</Label>
+                  <span className="text-sm font-mono bg-muted px-2 py-1 rounded">
+                    {settings.resolution}%
+                  </span>
+                </div>
                 <Slider
                   value={[settings.resolution]}
-                  onValueChange={([v]) => setSettings((s) => ({ ...s, resolution: v }))}
-                  min={25}
+                  onValueChange={([value]) =>
+                    setSettings((prev) => ({ ...prev, resolution: value }))
+                  }
+                  min={10}
                   max={100}
-                  step={5}
+                  step={10}
+                  className="settings-slider"
                 />
-                <div className="text-sm mt-1.5">{settings.resolution}%</div>
+                <p className="text-xs text-muted-foreground">
+                  {Math.round(videoInfo.width * (settings.resolution / 100))}×
+                  {Math.round(videoInfo.height * (settings.resolution / 100))}
+                </p>
               </div>
 
-              <div>
-                <Label className="mb-1.5 block">פורמט</Label>
+              {/* Format */}
+              <div className="space-y-3">
+                <Label>פורמט תמונה</Label>
                 <Select
                   value={settings.format}
-                  onValueChange={(v: "png" | "jpeg" | "webp") =>
-                    setSettings((s) => ({ ...s, format: v }))
+                  onValueChange={(value: "png" | "jpeg" | "webp") =>
+                    setSettings((prev) => ({ ...prev, format: value }))
                   }
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="webp">WebP – מומלץ</SelectItem>
-                    <SelectItem value="jpeg">JPEG</SelectItem>
-                    <SelectItem value="png">PNG – ללא אובדן</SelectItem>
+                    <SelectItem value="png">PNG (איכות מקסימלית)</SelectItem>
+                    <SelectItem value="jpeg">JPEG (קובץ קטן יותר)</SelectItem>
+                    <SelectItem value="webp">WebP (מאוזן)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-            </div>
 
-            <div className="mt-8">
-              <Label className="mb-1.5 block">מנוע חילוץ</Label>
-              <Select
-                value={method}
-                onValueChange={(v: "webcodecs" | "canvas") => setMethod(v)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="webcodecs" disabled={!supportsWebCodecs}>
-                    WebCodecs + MP4Box (מהיר מאוד)
-                  </SelectItem>
-                  <SelectItem value="canvas">
-                    Canvas (איטי יותר, תמיד זמין)
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              {/* Quality */}
+              {settings.format !== "png" && (
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center">
+                    <Label>איכות תמונה</Label>
+                    <span className="text-sm font-mono bg-muted px-2 py-1 rounded">
+                      {Math.round(settings.quality * 100)}%
+                    </span>
+                  </div>
+                  <Slider
+                    value={[settings.quality * 100]}
+                    onValueChange={([value]) =>
+                      setSettings((prev) => ({ ...prev, quality: value / 100 }))
+                    }
+                    min={10}
+                    max={100}
+                    step={5}
+                    className="settings-slider"
+                  />
+                </div>
+              )}
             </div>
           </Card>
+        )}
 
-          {/* כפתורים + התקדמות */}
-          <div className="flex flex-wrap justify-center gap-4 mb-8">
-            <Button
-              size="lg"
-              onClick={startExtraction}
-              disabled={isExtracting || isAnalyzing}
-            >
-              {isExtracting ? (
-                <>
-                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                  מחלץ... {Math.round(progress)}%
-                </>
-              ) : (
-                <>
-                  <Zap className="mr-2 h-5 w-5" />
-                  חלץ פריימים
-                </>
+        {/* Progress & Actions */}
+        {videoInfo && (
+          <Card className="p-6 action-card">
+            <div className="space-y-6">
+              {isExtracting && (
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium">מחלץ פריימים...</span>
+                      {extractionMethod && (
+                        <span className="text-xs px-2 py-0.5 bg-primary/10 text-primary rounded-full">
+                          {extractionMethod}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-sm text-muted-foreground">
+                      {Math.round(extractionProgress)}%
+                    </span>
+                  </div>
+                  <Progress value={extractionProgress} className="progress-bar" />
+                </div>
               )}
-            </Button>
 
-            {isExtracting && (
-              <Button variant="destructive" size="lg" onClick={() => abortCtrl?.abort()}>
-                בטל
-              </Button>
-            )}
+              {extractedFrames.length > 0 && !isExtracting && (
+                <div className="extracted-summary flex items-center gap-3 p-4 rounded-lg">
+                  <ImageIcon className="w-8 h-8 text-success" />
+                  <div>
+                    <p className="font-medium">
+                      חולצו {extractedFrames.length} פריימים בהצלחה!
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      מוכן להורדה כקובץ ZIP
+                      {extractionMethod && ` • שיטה: ${extractionMethod}`}
+                    </p>
+                  </div>
+                </div>
+              )}
 
-            {extractedFrames.length > 0 && (
-              <>
-                <Button variant="outline" size="lg" onClick={downloadZip}>
-                  <Download className="mr-2 h-5 w-5" />
-                  הורד ZIP ({extractedFrames.length} תמונות)
-                </Button>
-
+              <div className="flex flex-col sm:flex-row gap-3">
                 <Button
-                  variant="ghost"
+                  onClick={extractFrames}
+                  disabled={isExtracting || !videoFile}
+                  className="extract-button flex-1"
                   size="lg"
-                  onClick={() => {
-                    setExtractedFrames([]);
-                    setPreviewUrls([]);
-                  }}
                 >
-                  <Trash2 className="mr-2 h-5 w-5" />
-                  נקה
+                  {isExtracting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      מחלץ...
+                    </>
+                  ) : (
+                    <>
+                      <Film className="w-4 h-4 mr-2" />
+                      התחל חילוץ
+                      {useWebCodecs && (
+                        <Zap className="w-4 h-4 mr-1 text-primary" />
+                      )}
+                    </>
+                  )}
                 </Button>
-              </>
-            )}
-          </div>
 
-          {progress > 0 && progress < 100 && (
-            <Progress value={progress} className="mb-8 h-2.5" />
-          )}
-
-          {/* Preview */}
-          {previewUrls.length > 0 && (
-            <Card className="p-6">
-              <h2 className="text-xl font-semibold mb-5">תצוגה מקדימה (ראשונים)</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-9 gap-3">
-                {previewUrls.map((url, i) => (
-                  <img
-                    key={i}
-                    src={url}
-                    alt={`frame ${i + 1}`}
-                    className="w-full aspect-video object-cover rounded shadow-sm bg-black/5"
-                    loading="lazy"
-                  />
-                ))}
+                {extractedFrames.length > 0 && (
+                  <Button
+                    onClick={downloadAsZip}
+                    variant="secondary"
+                    className="download-button flex-1"
+                    size="lg"
+                  >
+                    <Download className="w-4 h-4 mr-2" />
+                    הורד ZIP ({extractedFrames.length} פריימים)
+                  </Button>
+                )}
               </div>
-            </Card>
-          )}
-        </>
-      )}
+            </div>
+          </Card>
+        )}
 
-      {/* Hidden elements */}
-      <video ref={videoRef} className="hidden" preload="metadata" />
-      <canvas ref={canvasRef} className="hidden" />
+        {/* Hidden elements for processing */}
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          className="hidden"
+          playsInline
+          muted
+        />
+        <canvas ref={canvasRef} className="hidden" />
+      </div>
     </div>
   );
 };
