@@ -122,6 +122,25 @@ const VideoFrameExtractor = () => {
       let videoTrackId: number | null = null;
       let codecConfig: VideoDecoderConfig | null = null;
 
+      let rejected = false;
+      const fail = (err: unknown) => {
+        if (rejected) return;
+        rejected = true;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (mp4boxFile as any).stop?.();
+        } catch {
+          // ignore
+        }
+        try {
+          decoderClosed = true;
+          decoder.close();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      };
+
       const decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
           const timestamp = frame.timestamp;
@@ -154,7 +173,7 @@ const VideoFrameExtractor = () => {
         error: (e) => {
           console.error("Decoder error:", e);
           if (!decoderClosed) {
-            reject(e);
+            fail(e);
           }
         },
       });
@@ -176,6 +195,46 @@ const VideoFrameExtractor = () => {
         
         // Extract description (avcC/hvcC) for H.264/HEVC codecs
         let description: Uint8Array | undefined;
+
+        const serializeMp4Box = (box: unknown): Uint8Array | undefined => {
+          if (!box) return undefined;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const b: any = box;
+          if (b instanceof Uint8Array) return b;
+          if (b?.data instanceof Uint8Array) return b.data;
+          if (b?.data instanceof ArrayBuffer) return new Uint8Array(b.data);
+          if (b?.buffer instanceof ArrayBuffer && typeof b.byteOffset === "number" && typeof b.byteLength === "number") {
+            return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+          }
+          if (b?.buffer instanceof ArrayBuffer) return new Uint8Array(b.buffer);
+
+          // Try to serialize via MP4Box's internal DataStream if available.
+          // This usually writes a full MP4 box (size+type+payload), so we strip the 8-byte header.
+          if (typeof b?.write === "function") {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const DataStreamCtor = (MP4Box as any).DataStream;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const Endianness = (MP4Box as any).Endianness;
+            if (DataStreamCtor) {
+              try {
+                const stream = new DataStreamCtor(undefined, 0, Endianness?.BIG_ENDIAN ?? 1);
+                b.write(stream);
+                const total = stream?.buffer as ArrayBuffer | undefined;
+                const endPos = typeof stream?.position === "number" ? stream.position : undefined;
+                if (total && endPos && endPos > 8) {
+                  return new Uint8Array(total.slice(8, endPos));
+                }
+                if (total && total.byteLength > 8) {
+                  return new Uint8Array(total.slice(8));
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+
+          return undefined;
+        };
         
         try {
           // Get the track box to access codec-specific configuration
@@ -186,28 +245,11 @@ const VideoFrameExtractor = () => {
           if (entry) {
             // For H.264 (AVC) - avcC box contains SPS/PPS
             if (entry.avcC) {
-              const avcC = entry.avcC;
-              // avcC can be a DataStream or have a write method
-              if (avcC.write) {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const stream = new (MP4Box as any).DataStream(undefined, 0, 1); // 1 = BIG_ENDIAN
-                avcC.write(stream);
-                description = new Uint8Array(stream.buffer, 8); // Skip box header (8 bytes)
-              } else if (avcC.data) {
-                description = new Uint8Array(avcC.data);
-              }
+              description = serializeMp4Box(entry.avcC);
             }
             // For HEVC - hvcC box
             else if (entry.hvcC) {
-              const hvcC = entry.hvcC;
-              if (hvcC.write) {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const stream = new (MP4Box as any).DataStream(undefined, 0, 1);
-                hvcC.write(stream);
-                description = new Uint8Array(stream.buffer, 8);
-              } else if (hvcC.data) {
-                description = new Uint8Array(hvcC.data);
-              }
+              description = serializeMp4Box(entry.hvcC);
             }
           }
         } catch (e) {
@@ -217,7 +259,7 @@ const VideoFrameExtractor = () => {
         // For AVC codecs, description is required
         if (codecString.startsWith("avc") && !description) {
           console.warn("No AVC description found, falling back to legacy method");
-          reject(new Error("AVC description required for WebCodecs"));
+          fail(new Error("AVC description required for WebCodecs"));
           return;
         }
         
@@ -234,7 +276,7 @@ const VideoFrameExtractor = () => {
           mp4boxFile.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
           mp4boxFile.start();
         } catch (e) {
-          reject(e);
+          fail(e);
         }
       };
 
@@ -254,13 +296,17 @@ const VideoFrameExtractor = () => {
             decoder.decode(chunk);
           } catch (e) {
             console.error("Error decoding sample:", e);
+            // If WebCodecs decoding fails (common with missing/invalid description or keyframe requirements),
+            // stop this path so the caller can fall back to the legacy extractor.
+            fail(e);
+            return;
           }
         }
       };
 
       mp4boxFile.onError = (_module: string, message: string) => {
         console.error("MP4Box error:", message);
-        reject(new Error(message));
+        fail(new Error(message));
       };
 
       // Read file in chunks for better performance
