@@ -159,6 +159,8 @@ const VideoFrameExtractor = () => {
         },
       });
 
+      let trackTimescale = 1;
+      
       mp4boxFile.onReady = (info: MP4Box.Movie) => {
         const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
         if (!videoTrack) {
@@ -167,6 +169,7 @@ const VideoFrameExtractor = () => {
         }
 
         videoTrackId = videoTrack.id;
+        trackTimescale = videoTrack.timescale;
         
         // Build codec string for WebCodecs
         const codecString = videoTrack.codec;
@@ -189,10 +192,14 @@ const VideoFrameExtractor = () => {
       mp4boxFile.onSamples = (_trackId: number, _user: unknown, samples: MP4Box.Sample[]) => {
         for (const sample of samples) {
           try {
+            // Convert from track timescale to microseconds
+            const timestampUs = Math.floor(((sample.cts || 0) / trackTimescale) * 1000000);
+            const durationUs = Math.floor(((sample.duration || 0) / trackTimescale) * 1000000);
+            
             const chunk = new EncodedVideoChunk({
               type: sample.is_sync ? "key" : "delta",
-              timestamp: ((sample.cts || 0) / videoInfo.frameRate) * 1000000,
-              duration: ((sample.duration || 0) / videoInfo.frameRate) * 1000,
+              timestamp: timestampUs,
+              duration: durationUs,
               data: sample.data!,
             });
             decoder.decode(chunk);
