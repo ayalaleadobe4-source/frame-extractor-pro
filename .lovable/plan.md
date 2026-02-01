@@ -1,115 +1,85 @@
 
 
-# תוכנית: שדרוג מהירות חילוץ הפריימים עם WebCodecs API
+# תיקון: הוספת Description עבור H.264/AVC ב-WebCodecs
 
-## הבעיה הנוכחית
+## הבעיה
 
-המימוש הקיים משתמש בשיטה איטית מאוד:
-```text
-לולאה סדרתית:
-┌─────────────────────────────────────────────────────────────┐
-│  video.currentTime = X  →  המתן ל-onseeked  →  canvas.draw  │
-│         ↓                                                    │
-│  video.currentTime = X+1 →  המתן ל-onseeked  →  canvas.draw │
-│         ↓                                                    │
-│        ...  (כל פריים בנפרד, בזה אחר זה)                    │
-└─────────────────────────────────────────────────────────────┘
-```
+השגיאה "A key frame is required after configure() or flush()" מופיעה כי עבור קודקים מסוג H.264 (AVC), ה-VideoDecoder דורש שדה `description` בקונפיגורציה. שדה זה מכיל את המידע ההכרחי (SPS/PPS) לאתחול הדיקודר.
 
-**בעיות:**
-- Seek סדרתי - כל פריים ממתין לסיום ה-seek של הקודם (מאות מילי-שניות לפריים)
-- Canvas 2D - עובד על CPU בלבד, לא מנצל GPU
-- אין עיבוד מקבילי
+## הפתרון
 
-## הפתרון: WebCodecs API עם MP4Box
-
-```text
-WebCodecs Pipeline (מקבילי + GPU):
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│   MP4Box     │ →  │ VideoDecoder │ →  │  VideoFrame  │
-│  (Demuxer)   │    │ (Hardware    │    │  (GPU-based) │
-│              │    │  Accelerated)│    │              │
-└──────────────┘    └──────────────┘    └──────────────┘
-     הפרדת           פענוח מקבילי          ציור ישיר
-     chunks          עם GPU               על canvas
-```
-
-**יתרונות:**
-- פענוח חומרתי (GPU) - מהיר פי 10-50 מ-CPU
-- עיבוד מקבילי של מספר פריימים במקביל
-- ללא Seek - קריאה ישירה של ה-chunks מהקובץ
+הוספת חילוץ ה-Description מה-MP4Box והעברתו לקונפיגורציית ה-Decoder.
 
 ## שלבי המימוש
 
-### שלב 1: הוספת ספריית getVideoFrames.js
-- ספרייה מוכנה שמשלבת WebCodecs + MP4Box בצורה אופטימלית
-- מיובאת מ-CDN (deno.land) - ללא צורך בהתקנה
-- תומכת בקבצי MP4 עם האצת חומרה
+### שלב 1: חילוץ ה-Description מ-MP4Box
 
-### שלב 2: יצירת Worker לעיבוד ברקע (אופציונלי)
-- העברת העיבוד ל-Web Worker
-- שחרור ה-Main Thread לממשק משתמש חלק
-- מניעת קפיאה בזמן עיבוד
+ב-`mp4boxFile.onReady`, נחלץ את ה-description מה-track:
 
-### שלב 3: שינוי פונקציית extractFrames
-לפני:
-```javascript
-for (let i = 0; i < framesToExtract; i++) {
-  video.currentTime = i * frameInterval;
-  await waitForSeek();  // איטי מאוד!
-  ctx.drawImage(video, ...);
-  blob = await canvas.toBlob(...);
-}
-```
-
-אחרי:
-```javascript
-await getVideoFrames({
-  videoUrl,
-  onFrame(frame) {
-    // פריימים מגיעים במהירות גבוהה
-    // סינון לפי FPS הנדרש
-    if (shouldKeepFrame(frame.timestamp)) {
-      ctx.drawImage(frame, ...);
-      // המרה ל-blob במקביל
+```typescript
+mp4boxFile.onReady = (info: MP4Box.Movie) => {
+  const videoTrack = info.tracks.find((track) => track.type === "video");
+  
+  // Get the description (extradata) for H.264/HEVC
+  let description: Uint8Array | undefined;
+  
+  // MP4Box stores codec-specific data in the track
+  const trak = mp4boxFile.getTrackById(videoTrack.id);
+  if (trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]) {
+    const entry = trak.mdia.minf.stbl.stsd.entries[0];
+    // For H.264 - avcC box
+    if (entry.avcC) {
+      description = new Uint8Array(entry.avcC.data || entry.avcC);
     }
-    frame.close();
+    // For HEVC - hvcC box
+    else if (entry.hvcC) {
+      description = new Uint8Array(entry.hvcC.data || entry.hvcC);
+    }
   }
-});
+  
+  codecConfig = {
+    codec: videoTrack.codec,
+    codedWidth: videoTrack.video?.width,
+    codedHeight: videoTrack.video?.height,
+    hardwareAcceleration: "prefer-hardware",
+    description: description, // ✅ הוספת ה-description
+  };
+};
 ```
 
-### שלב 4: אופטימיזציות נוספות
-- Batching - המרת מספר פריימים ל-blob במקביל
-- OffscreenCanvas - ציור ב-Worker (אם נשתמש ב-Worker)
-- Throttling - בקרה על encodeQueueSize למניעת עומס
+### שלב 2: שימוש ב-getTrackById של MP4Box
 
-## פרטים טכניים
+MP4Box מספק את פונקציית `getTrackById` שמחזירה את כל המידע של ה-track, כולל ה-codec configuration box (avcC/hvcC).
 
-### תלויות חדשות
-- שימוש ב-getVideoFrames.js מ-CDN (ללא התקנה ב-package.json)
-- ניצול MP4Box שכבר מותקן בפרויקט
+### שלב 3: טיפול בפורמטים שונים
 
-### תמיכה בפורמטים
-- MP4: תמיכה מלאה עם WebCodecs
-- פורמטים אחרים: fallback לשיטה הישנה
+```text
+פורמט הווידאו -> Box שמכיל Description
+───────────────────────────────────────
+H.264 (AVC)  -> avcC (AVC Configuration Box)
+H.265 (HEVC) -> hvcC (HEVC Configuration Box)  
+VP9          -> vpcC (VP9 Configuration Box)
+AV1          -> av1C (AV1 Configuration Box)
+```
 
-### בדיקת תמיכה בדפדפן
-```javascript
-if ('VideoDecoder' in window) {
-  // השתמש ב-WebCodecs (מהיר)
-} else {
-  // Fallback לשיטה הישנה (איטי)
+### שלב 4: Fallback אם אין Description
+
+אם לא מצליחים לחלץ את ה-description, נעבור אוטומטית לשיטת ה-Legacy:
+
+```typescript
+if (codecString.startsWith("avc") && !description) {
+  console.warn("No AVC description found, falling back to legacy");
+  throw new Error("AVC description required");
 }
 ```
 
-### הערכת שיפור ביצועים
-- וידאו של 30 שניות ב-30 FPS (900 פריימים):
-  - שיטה נוכחית: כ-5-10 דקות
-  - עם WebCodecs: כ-10-30 שניות
-  - שיפור של פי 10-30
+## קובץ לעריכה
 
-## מגבלות
-- WebCodecs נתמך רק בדפדפנים מודרניים (Chrome 94+, Edge 94+, Safari 16.4+)
-- MP4 בלבד עם WebCodecs (פורמטים אחרים ישתמשו ב-fallback)
-- דורש HTTPS או localhost
+`src/components/VideoFrameExtractor.tsx` - עדכון פונקציית `extractFramesWebCodecs`
+
+## תוצאה צפויה
+
+- חילוץ מהיר עם GPU עבור קבצי H.264/AVC
+- ללא שגיאות "key frame required"
+- Fallback אוטומטי לשיטה הישנה אם יש בעיה
 
