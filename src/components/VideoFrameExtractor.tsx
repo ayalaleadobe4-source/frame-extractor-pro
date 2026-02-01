@@ -173,11 +173,60 @@ const VideoFrameExtractor = () => {
         
         // Build codec string for WebCodecs
         const codecString = videoTrack.codec;
+        
+        // Extract description (avcC/hvcC) for H.264/HEVC codecs
+        let description: Uint8Array | undefined;
+        
+        try {
+          // Get the track box to access codec-specific configuration
+          const trak = mp4boxFile.getTrackById(videoTrackId);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const entry = (trak as any)?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+          
+          if (entry) {
+            // For H.264 (AVC) - avcC box contains SPS/PPS
+            if (entry.avcC) {
+              const avcC = entry.avcC;
+              // avcC can be a DataStream or have a write method
+              if (avcC.write) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const stream = new (MP4Box as any).DataStream(undefined, 0, 1); // 1 = BIG_ENDIAN
+                avcC.write(stream);
+                description = new Uint8Array(stream.buffer, 8); // Skip box header (8 bytes)
+              } else if (avcC.data) {
+                description = new Uint8Array(avcC.data);
+              }
+            }
+            // For HEVC - hvcC box
+            else if (entry.hvcC) {
+              const hvcC = entry.hvcC;
+              if (hvcC.write) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const stream = new (MP4Box as any).DataStream(undefined, 0, 1);
+                hvcC.write(stream);
+                description = new Uint8Array(stream.buffer, 8);
+              } else if (hvcC.data) {
+                description = new Uint8Array(hvcC.data);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Could not extract codec description:", e);
+        }
+        
+        // For AVC codecs, description is required
+        if (codecString.startsWith("avc") && !description) {
+          console.warn("No AVC description found, falling back to legacy method");
+          reject(new Error("AVC description required for WebCodecs"));
+          return;
+        }
+        
         codecConfig = {
           codec: codecString,
           codedWidth: (videoTrack as { video?: { width: number; height: number } }).video?.width || videoInfo.width,
           codedHeight: (videoTrack as { video?: { width: number; height: number } }).video?.height || videoInfo.height,
           hardwareAcceleration: "prefer-hardware" as HardwareAcceleration,
+          description: description,
         };
 
         try {
