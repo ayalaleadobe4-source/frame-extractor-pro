@@ -1,14 +1,13 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
-import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap, Cpu } from "lucide-react";
+import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap } from "lucide-react";
 import JSZip from "jszip";
 import * as MP4Box from "mp4box";
-import { useFrameProcessorPool } from "@/hooks/useFrameProcessorPool";
 
 interface VideoInfo {
   width: number;
@@ -37,7 +36,6 @@ const VideoFrameExtractor = () => {
   const [extractedFrames, setExtractedFrames] = useState<Blob[]>([]);
   const [useWebCodecs, setUseWebCodecs] = useState<boolean | null>(null);
   const [extractionMethod, setExtractionMethod] = useState<string>("");
-  const [workerPoolSize, setWorkerPoolSize] = useState<number>(0);
   const [settings, setSettings] = useState<ExtractionSettings>({
     fps: 1,
     resolution: 100,
@@ -49,20 +47,6 @@ const VideoFrameExtractor = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  
-  // Worker pool for parallel frame processing
-  const { initPool, processFrame, isSupported: isWorkerPoolSupported, getPoolSize } = useFrameProcessorPool();
-
-  // Initialize worker pool on mount
-  useEffect(() => {
-    if (isWorkerPoolSupported()) {
-      initPool();
-      // Small delay to allow workers to initialize
-      setTimeout(() => {
-        setWorkerPoolSize(getPoolSize());
-      }, 100);
-    }
-  }, [initPool, isWorkerPoolSupported, getPoolSize]);
 
   // Check WebCodecs support
   const supportsWebCodecs = useCallback(() => {
@@ -106,33 +90,22 @@ const VideoFrameExtractor = () => {
     });
   };
 
-  // WebCodecs-based fast extraction with Worker Pool
-  const extractFramesWebCodecs = useCallback(async (
+  // WebCodecs-based fast extraction
+  const extractFramesWebCodecs = async (
     file: File,
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
     onProgress: (progress: number) => void
   ): Promise<Blob[]> => {
-    const useWorkerPool = isWorkerPoolSupported() && workerPoolSize > 0;
-    
     return new Promise((resolve, reject) => {
-      // Map to store frames by index (for ordering)
-      const frameMap = new Map<number, Blob>();
-      let frameIndex = 0;
+      const frames: Blob[] = [];
+      const canvas = canvasRef.current!;
+      const ctx = canvas.getContext("2d")!;
 
       const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
       const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
-
-      // Only use canvas if not using worker pool
-      let canvas: HTMLCanvasElement | null = null;
-      let ctx: CanvasRenderingContext2D | null = null;
-      
-      if (!useWorkerPool) {
-        canvas = canvasRef.current!;
-        ctx = canvas.getContext("2d")!;
-        canvas.width = outputWidth;
-        canvas.height = outputHeight;
-      }
+      canvas.width = outputWidth;
+      canvas.height = outputHeight;
 
       const frameIntervalMicroseconds = (1000000 / settings.fps);
       let lastExtractedTimestamp = -frameIntervalMicroseconds;
@@ -175,63 +148,27 @@ const VideoFrameExtractor = () => {
           // Check if we should keep this frame based on target FPS
           if (timestamp - lastExtractedTimestamp >= frameIntervalMicroseconds * 0.9) {
             lastExtractedTimestamp = timestamp;
-            const currentFrameIndex = frameIndex++;
             
-            if (useWorkerPool) {
-              // Create ImageBitmap from VideoFrame for worker processing
-              const blobPromise = (async () => {
-                try {
-                  // Create ImageBitmap from VideoFrame (transferable to worker)
-                  const bitmap = await createImageBitmap(frame, {
-                    resizeWidth: outputWidth,
-                    resizeHeight: outputHeight,
-                    resizeQuality: 'high',
-                  });
-                  frame.close();
-                  
-                  // Process in worker pool
-                  const blob = await processFrame(
-                    bitmap,
-                    outputWidth,
-                    outputHeight,
-                    settings.format,
-                    settings.quality,
-                    currentFrameIndex
-                  );
-                  
-                  frameMap.set(currentFrameIndex, blob);
-                  processedFrameCount++;
-                  onProgress((processedFrameCount / targetFrameCount) * 100);
-                } catch (e) {
-                  console.error("Worker processing error:", e);
-                  frame.close();
-                }
-              })();
-              pendingBlobs.push(blobPromise);
-            } else {
-              // Fallback: use main thread canvas
-              ctx!.drawImage(frame, 0, 0, outputWidth, outputHeight);
-              frame.close();
-              
-              const blobPromise = new Promise<void>((resolveBlob) => {
-                canvas!.toBlob(
-                  (blob) => {
-                    if (blob) {
-                      frameMap.set(currentFrameIndex, blob);
-                      processedFrameCount++;
-                      onProgress((processedFrameCount / targetFrameCount) * 100);
-                    }
-                    resolveBlob();
-                  },
-                  mimeType,
-                  quality
-                );
-              });
-              pendingBlobs.push(blobPromise);
-            }
-          } else {
-            frame.close();
+            ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
+            
+            const blobPromise = new Promise<void>((resolveBlob) => {
+              canvas.toBlob(
+                (blob) => {
+                  if (blob) {
+                    frames.push(blob);
+                    processedFrameCount++;
+                    onProgress((processedFrameCount / targetFrameCount) * 100);
+                  }
+                  resolveBlob();
+                },
+                mimeType,
+                quality
+              );
+            });
+            pendingBlobs.push(blobPromise);
           }
+          
+          frame.close();
         },
         error: (e) => {
           console.error("Decoder error:", e);
@@ -385,13 +322,7 @@ const VideoFrameExtractor = () => {
             decoderClosed = true;
             decoder.close();
             await Promise.all(pendingBlobs);
-            // Convert frameMap to ordered array
-            const sortedFrames: Blob[] = [];
-            const keys = Array.from(frameMap.keys()).sort((a, b) => a - b);
-            for (const key of keys) {
-              sortedFrames.push(frameMap.get(key)!);
-            }
-            resolve(sortedFrames);
+            resolve(frames);
           }).catch(reject);
           return;
         }
@@ -414,7 +345,7 @@ const VideoFrameExtractor = () => {
 
       readNextChunk();
     });
-  }, [isWorkerPoolSupported, workerPoolSize, processFrame]);
+  };
 
   // Fallback: Legacy seek-based extraction
   const extractFramesLegacy = async (
@@ -617,26 +548,18 @@ const VideoFrameExtractor = () => {
           <p className="text-muted-foreground">
             העלה וידאו, בחר הגדרות והורד את כל הפריימים כקובץ ZIP
           </p>
-          <div className="flex flex-wrap justify-center gap-2">
-            {useWebCodecs !== null && (
-              <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm ${
-                useWebCodecs 
-                  ? "bg-green-500/10 text-green-600 dark:text-green-400" 
-                  : "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
-              }`}>
-                <Zap className="w-4 h-4" />
-                {useWebCodecs 
-                  ? "WebCodecs זמין - חילוץ מהיר עם GPU" 
-                  : "WebCodecs לא נתמך - שימוש בשיטה רגילה"}
-              </div>
-            )}
-            {workerPoolSize > 0 && (
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm bg-blue-500/10 text-blue-600 dark:text-blue-400">
-                <Cpu className="w-4 h-4" />
-                {`${workerPoolSize} Workers מקביליים`}
-              </div>
-            )}
-          </div>
+          {useWebCodecs !== null && (
+            <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm ${
+              useWebCodecs 
+                ? "bg-green-500/10 text-green-600 dark:text-green-400" 
+                : "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400"
+            }`}>
+              <Zap className="w-4 h-4" />
+              {useWebCodecs 
+                ? "WebCodecs זמין - חילוץ מהיר עם GPU" 
+                : "WebCodecs לא נתמך - שימוש בשיטה רגילה"}
+            </div>
+          )}
         </div>
 
         {/* Upload Zone */}
