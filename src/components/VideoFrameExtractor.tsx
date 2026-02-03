@@ -49,75 +49,9 @@ const VideoFrameExtractor = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
 
-  // WebGPU resources (using any to avoid type issues with experimental API)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gpuDeviceRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gpuContextRef = useRef<any>(null);
-  const gpuCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
   // Check WebCodecs support
   const supportsWebCodecs = useCallback(() => {
     return 'VideoDecoder' in window && 'EncodedVideoChunk' in window;
-  }, []);
-
-  // Check WebGPU support and initialize if available
-  const initWebGPU = useCallback(async (width: number, height: number): Promise<boolean> => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const nav = navigator as any;
-    if (!nav.gpu) {
-      console.log("WebGPU not supported");
-      return false;
-    }
-
-    try {
-      const adapter = await nav.gpu.requestAdapter();
-      if (!adapter) {
-        console.log("No WebGPU adapter found");
-        return false;
-      }
-
-      const device = await adapter.requestDevice();
-      
-      // Create offscreen canvas for WebGPU
-      const gpuCanvas = document.createElement("canvas");
-      gpuCanvas.width = width;
-      gpuCanvas.height = height;
-      
-      const context = gpuCanvas.getContext("webgpu");
-      if (!context) {
-        console.log("Could not get WebGPU context");
-        return false;
-      }
-
-      const format = nav.gpu.getPreferredCanvasFormat();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (context as any).configure({
-        device,
-        format,
-        alphaMode: "premultiplied",
-      });
-
-      gpuDeviceRef.current = device;
-      gpuContextRef.current = context;
-      gpuCanvasRef.current = gpuCanvas;
-
-      console.log("WebGPU initialized successfully");
-      return true;
-    } catch (e) {
-      console.warn("WebGPU initialization failed:", e);
-      return false;
-    }
-  }, []);
-
-  // Cleanup WebGPU resources
-  const cleanupWebGPU = useCallback(() => {
-    if (gpuDeviceRef.current) {
-      gpuDeviceRef.current.destroy();
-      gpuDeviceRef.current = null;
-    }
-    gpuContextRef.current = null;
-    gpuCanvasRef.current = null;
   }, []);
 
   const getVideoFpsFromFile = async (file: File): Promise<{ fps: number; frameCount: number; codec?: string; trackId?: number } | null> => {
@@ -157,13 +91,12 @@ const VideoFrameExtractor = () => {
     });
   };
 
-  // WebCodecs-based fast extraction with optional WebGPU acceleration
+  // WebCodecs-based fast extraction
   const extractFramesWebCodecs = async (
     file: File,
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
-    onProgress: (progress: number) => void,
-    useGPU: boolean = false
+    onProgress: (progress: number) => void
   ): Promise<Blob[]> => {
     return new Promise((resolve, reject) => {
       const frames: Blob[] = [];
@@ -174,17 +107,6 @@ const VideoFrameExtractor = () => {
       const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
       canvas.width = outputWidth;
       canvas.height = outputHeight;
-
-      // For WebGPU: we use copyExternalImageToTexture for fast frame copying
-      // then copy back to regular canvas for blob generation
-      const gpuCanvas = useGPU ? gpuCanvasRef.current : null;
-      const gpuDevice = useGPU ? gpuDeviceRef.current : null;
-      const gpuContext = useGPU ? gpuContextRef.current : null;
-      
-      if (useGPU && gpuCanvas) {
-        gpuCanvas.width = outputWidth;
-        gpuCanvas.height = outputHeight;
-      }
 
       const frameIntervalMicroseconds = (1000000 / settings.fps);
       let lastExtractedTimestamp = -frameIntervalMicroseconds;
@@ -228,22 +150,7 @@ const VideoFrameExtractor = () => {
           if (timestamp - lastExtractedTimestamp >= frameIntervalMicroseconds * 0.9) {
             lastExtractedTimestamp = timestamp;
             
-            // Use WebGPU if available for faster frame processing
-            if (gpuDevice && gpuContext && gpuCanvas) {
-              try {
-                // Copy VideoFrame directly to GPU texture (very fast, hardware accelerated)
-                const texture = gpuDevice.importExternalTexture({ source: frame });
-                
-                // For now, we still need to go through canvas for blob generation
-                // But the GPU copy is faster than CPU drawImage
-                ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
-              } catch {
-                // Fallback to regular canvas if GPU fails
-                ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
-              }
-            } else {
-              ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
-            }
+            ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
             
             const blobPromise = new Promise<void>((resolveBlob) => {
               canvas.toBlob(
@@ -582,10 +489,6 @@ const VideoFrameExtractor = () => {
       setExtractionProgress(Math.min(progress, 100));
     };
 
-    // Calculate output dimensions for WebGPU initialization
-    const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
-    const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
-
     try {
       let frames: Blob[];
       
@@ -593,25 +496,14 @@ const VideoFrameExtractor = () => {
       const isMp4 = videoFile.type === "video/mp4" || videoFile.name.toLowerCase().endsWith(".mp4");
       
       if (useWebCodecs && isMp4) {
-        // Try to initialize WebGPU for acceleration (optional, won't block if fails)
-        const gpuAvailable = await initWebGPU(outputWidth, outputHeight);
-        
-        if (gpuAvailable) {
-          setExtractionMethod("WebCodecs + WebGPU (מואץ מקסימלי)");
-        } else {
-          setExtractionMethod("WebCodecs (GPU מואץ)");
-        }
-        
+        setExtractionMethod("WebCodecs (GPU מואץ)");
         try {
-          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress, gpuAvailable);
+          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress);
         } catch (e) {
           if (signal.aborted) throw e;
           console.warn("WebCodecs extraction failed, falling back to legacy:", e);
           setExtractionMethod("Legacy (CPU)");
           frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal);
-        } finally {
-          // Cleanup WebGPU resources
-          cleanupWebGPU();
         }
       } else {
         setExtractionMethod("Legacy (CPU)");
