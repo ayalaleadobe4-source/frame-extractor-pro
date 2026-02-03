@@ -5,7 +5,7 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
-import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap } from "lucide-react";
+import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap, X } from "lucide-react";
 import JSZip from "jszip";
 import * as MP4Box from "mp4box";
 
@@ -47,6 +47,7 @@ const VideoFrameExtractor = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const [isCancelling, setIsCancelling] = useState(false);
 
   // Check WebCodecs support
   const supportsWebCodecs = useCallback(() => {
@@ -351,7 +352,8 @@ const VideoFrameExtractor = () => {
   const extractFramesLegacy = async (
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
-    onProgress: (progress: number) => void
+    onProgress: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<Blob[]> => {
     const video = videoRef.current!;
     const canvas = canvasRef.current!;
@@ -369,6 +371,11 @@ const VideoFrameExtractor = () => {
     video.currentTime = 0;
 
     for (let i = 0; i < framesToExtract; i++) {
+      // Check for cancellation
+      if (signal?.aborted) {
+        throw new DOMException("Extraction cancelled", "AbortError");
+      }
+
       const targetTime = i * frameInterval;
       
       await new Promise<void>((resolve) => {
@@ -471,10 +478,12 @@ const VideoFrameExtractor = () => {
     if (!videoFile || !videoInfo) return;
 
     setIsExtracting(true);
+    setIsCancelling(false);
     setExtractedFrames([]);
     setExtractionProgress(0);
 
     abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
 
     const onProgress = (progress: number) => {
       setExtractionProgress(Math.min(progress, 100));
@@ -491,20 +500,36 @@ const VideoFrameExtractor = () => {
         try {
           frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress);
         } catch (e) {
+          if (signal.aborted) throw e;
           console.warn("WebCodecs extraction failed, falling back to legacy:", e);
           setExtractionMethod("Legacy (CPU)");
-          frames = await extractFramesLegacy(videoInfo, settings, onProgress);
+          frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal);
         }
       } else {
         setExtractionMethod("Legacy (CPU)");
-        frames = await extractFramesLegacy(videoInfo, settings, onProgress);
+        frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal);
       }
 
-      setExtractedFrames(frames);
+      if (!signal.aborted) {
+        setExtractedFrames(frames);
+      }
     } catch (e) {
-      console.error("Extraction failed:", e);
+      if (e instanceof DOMException && e.name === "AbortError") {
+        console.log("Extraction cancelled by user");
+      } else {
+        console.error("Extraction failed:", e);
+      }
     } finally {
       setIsExtracting(false);
+      setIsCancelling(false);
+      abortControllerRef.current = null;
+    }
+  };
+
+  const cancelExtraction = () => {
+    if (abortControllerRef.current) {
+      setIsCancelling(true);
+      abortControllerRef.current.abort();
     }
   };
 
@@ -783,29 +808,42 @@ const VideoFrameExtractor = () => {
               )}
 
               <div className="flex flex-col sm:flex-row gap-3">
-                <Button
-                  onClick={extractFrames}
-                  disabled={isExtracting || !videoFile}
-                  className="extract-button flex-1"
-                  size="lg"
-                >
-                  {isExtracting ? (
-                    <>
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                      מחלץ...
-                    </>
-                  ) : (
-                    <>
-                      <Film className="w-4 h-4 mr-2" />
-                      התחל חילוץ
-                      {useWebCodecs && (
-                        <Zap className="w-4 h-4 mr-1 text-primary" />
-                      )}
-                    </>
-                  )}
-                </Button>
+                {isExtracting ? (
+                  <Button
+                    onClick={cancelExtraction}
+                    disabled={isCancelling}
+                    variant="destructive"
+                    className="flex-1"
+                    size="lg"
+                  >
+                    {isCancelling ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        מבטל...
+                      </>
+                    ) : (
+                      <>
+                        <X className="w-4 h-4 mr-2" />
+                        בטל חילוץ
+                      </>
+                    )}
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={extractFrames}
+                    disabled={!videoFile}
+                    className="extract-button flex-1"
+                    size="lg"
+                  >
+                    <Film className="w-4 h-4 mr-2" />
+                    התחל חילוץ
+                    {useWebCodecs && (
+                      <Zap className="w-4 h-4 mr-1 text-primary" />
+                    )}
+                  </Button>
+                )}
 
-                {extractedFrames.length > 0 && (
+                {extractedFrames.length > 0 && !isExtracting && (
                   <Button
                     onClick={downloadAsZip}
                     variant="secondary"
