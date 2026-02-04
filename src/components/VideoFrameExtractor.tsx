@@ -96,9 +96,15 @@ const VideoFrameExtractor = () => {
     file: File,
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
-    onProgress: (progress: number) => void
+    onProgress: (progress: number) => void,
+    signal?: AbortSignal
   ): Promise<Blob[]> => {
     return new Promise((resolve, reject) => {
+      // Check for cancellation at start
+      if (signal?.aborted) {
+        reject(new DOMException("Extraction cancelled", "AbortError"));
+        return;
+      }
       const frames: Blob[] = [];
       const canvas = canvasRef.current!;
       const ctx = canvas.getContext("2d")!;
@@ -141,6 +147,12 @@ const VideoFrameExtractor = () => {
         }
         reject(err);
       };
+
+      // Listen for abort signal
+      const abortHandler = () => {
+        fail(new DOMException("Extraction cancelled", "AbortError"));
+      };
+      signal?.addEventListener("abort", abortHandler, { once: true });
 
       const decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
@@ -322,9 +334,13 @@ const VideoFrameExtractor = () => {
           decoder.flush().then(async () => {
             decoderClosed = true;
             decoder.close();
+            signal?.removeEventListener("abort", abortHandler);
             await Promise.all(pendingBlobs);
             resolve(frames);
-          }).catch(reject);
+          }).catch((e) => {
+            signal?.removeEventListener("abort", abortHandler);
+            reject(e);
+          });
           return;
         }
 
@@ -498,7 +514,7 @@ const VideoFrameExtractor = () => {
       if (useWebCodecs && isMp4) {
         setExtractionMethod("WebCodecs (GPU מואץ)");
         try {
-          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress);
+          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress, signal);
         } catch (e) {
           if (signal.aborted) throw e;
           console.warn("WebCodecs extraction failed, falling back to legacy:", e);
