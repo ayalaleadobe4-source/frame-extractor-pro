@@ -51,6 +51,9 @@ const VideoFrameExtractor = () => {
   const [isCancelling, setIsCancelling] = useState(false);
   const [saveMethod, setSaveMethod] = useState<"zip" | "folder">("zip");
   const [isCreatingOutput, setIsCreatingOutput] = useState(false);
+  const [selectedDirectory, setSelectedDirectory] = useState<FileSystemDirectoryHandle | null>(null);
+  const [videoUrlInput, setVideoUrlInput] = useState<string>("");
+  const [isLoadingFromUrl, setIsLoadingFromUrl] = useState(false);
 
   // Check WebCodecs support
   const supportsWebCodecs = useCallback(() => {
@@ -474,6 +477,7 @@ const VideoFrameExtractor = () => {
       setExtractionProgress(0);
       setExtractionMethod("");
       setStatusMessage("");
+      setSelectedDirectory(null); // Reset selected directory
       await analyzeVideo(file);
     }
   };
@@ -487,6 +491,7 @@ const VideoFrameExtractor = () => {
       setExtractionProgress(0);
       setExtractionMethod("");
       setStatusMessage("");
+      setSelectedDirectory(null); // Reset selected directory
       await analyzeVideo(file);
     }
   };
@@ -495,8 +500,74 @@ const VideoFrameExtractor = () => {
     event.preventDefault();
   };
 
+  const loadVideoFromUrl = async (url: string) => {
+    if (!url.trim()) return;
+
+    setIsLoadingFromUrl(true);
+    setVideoUrlInput(url);
+    
+    try {
+      // For URL-based videos, we create a blob URL after fetching
+      // This allows streaming extraction without full download
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch video: ${response.statusText}`);
+      }
+
+      // Get the blob from response
+      const blob = await response.blob();
+      const file = new File([blob], "video_from_url." + (blob.type.split('/')[1] || 'mp4'), { type: blob.type });
+      
+      setVideoFile(file);
+      setExtractedFrames([]);
+      setExtractionProgress(0);
+      setExtractionMethod("");
+      setStatusMessage("");
+      setSelectedDirectory(null);
+      await analyzeVideo(file);
+    } catch (error) {
+      console.error("Error loading video from URL:", error);
+      alert("שגיאה בטעינת הווידאו מהכתובת. ודא שהכתובת תקינה ונגישה.");
+    } finally {
+      setIsLoadingFromUrl(false);
+    }
+  };
+
+  const selectSaveFolder = async () => {
+    try {
+      // Check if File System Access API is supported
+      if (!('showDirectoryPicker' in window)) {
+        alert("הדפדפן שלך לא תומך בשמירה ישירה לתיקייה. אנא השתמש באפשרות ZIP.");
+        setSaveMethod("zip");
+        return false;
+      }
+
+      // Request directory access
+      const dirHandle = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+      setSelectedDirectory(dirHandle);
+      return true;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        console.log("User cancelled folder selection");
+        return false;
+      } else {
+        console.error("Error selecting folder:", err);
+        alert("שגיאה בבחירת התיקייה");
+        return false;
+      }
+    }
+  };
+
   const extractFrames = async () => {
     if (!videoFile || !videoInfo) return;
+
+    // If folder method is selected, first select the folder
+    if (saveMethod === "folder" && !selectedDirectory) {
+      const folderSelected = await selectSaveFolder();
+      if (!folderSelected) {
+        return; // User cancelled or error
+      }
+    }
 
     setIsExtracting(true);
     setIsCancelling(false);
@@ -603,18 +674,13 @@ const VideoFrameExtractor = () => {
 
   const saveFramesToFolder = async (frames: Blob[]) => {
     try {
-      // Check if File System Access API is supported
-      if (!('showDirectoryPicker' in window)) {
-        alert("הדפדפן שלך לא תומך בשמירה ישירה לתיקייה. אנא השתמש באפשרות ZIP.");
-        return;
+      if (!selectedDirectory) {
+        throw new Error("No directory selected");
       }
-
-      // Request directory access
-      const dirHandle = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
       
       // Create a subdirectory for frames
       const framesFolderName = `frames_${videoFile?.name.split(".")[0] || "video"}`;
-      const framesDir = await dirHandle.getDirectoryHandle(framesFolderName, { create: true });
+      const framesDir = await selectedDirectory.getDirectoryHandle(framesFolderName, { create: true });
 
       // Save each frame
       for (let i = 0; i < frames.length; i++) {
@@ -632,14 +698,9 @@ const VideoFrameExtractor = () => {
         setStatusMessage(`נשמר ${i + 1} מתוך ${frames.length} קבצים לתיקייה`);
       }
     } catch (err) {
-      if ((err as Error).name === 'AbortError') {
-        console.log("User cancelled folder selection");
-        setStatusMessage("בחירת התיקייה בוטלה");
-      } else {
-        console.error("Error saving to folder:", err);
-        alert("שגיאה בשמירת הקבצים לתיקייה");
-        setStatusMessage("שגיאה בשמירה");
-      }
+      console.error("Error saving to folder:", err);
+      alert("שגיאה בשמירת הקבצים לתיקייה");
+      setStatusMessage("שגיאה בשמירה");
       throw err;
     }
   };
@@ -680,50 +741,88 @@ const VideoFrameExtractor = () => {
 
         {/* Upload Zone */}
         <Card
-          className={`upload-zone p-8 border-2 border-dashed transition-all cursor-pointer ${
+          className={`upload-zone p-8 border-2 border-dashed transition-all ${
             videoFile ? "border-primary/50 bg-primary/5" : "border-border hover:border-primary/30"
           }`}
-          onClick={() => fileInputRef.current?.click()}
-          onDrop={handleDrop}
-          onDragOver={handleDragOver}
         >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/*"
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-          <div className="flex flex-col items-center justify-center gap-4">
-            {isAnalyzing ? (
-              <>
-                <Loader2 className="w-12 h-12 text-primary animate-spin" />
-                <p className="text-muted-foreground">מנתח את הווידאו...</p>
-              </>
-            ) : videoFile ? (
-              <>
-                <Film className="w-12 h-12 text-primary" />
-                <div className="text-center">
-                  <p className="font-medium text-foreground">{videoFile.name}</p>
-                  <p className="text-sm text-muted-foreground">
-                    לחץ להחלפת קובץ
+          <div 
+            className="cursor-pointer"
+            onClick={() => !isLoadingFromUrl && fileInputRef.current?.click()}
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/*"
+              onChange={handleFileSelect}
+              className="hidden"
+            />
+            <div className="flex flex-col items-center justify-center gap-4">
+              {isAnalyzing || isLoadingFromUrl ? (
+                <>
+                  <Loader2 className="w-12 h-12 text-primary animate-spin" />
+                  <p className="text-muted-foreground">
+                    {isLoadingFromUrl ? "טוען וידאו מכתובת..." : "מנתח את הווידאו..."}
                   </p>
-                </div>
-              </>
-            ) : (
-              <>
-                <Upload className="w-12 h-12 text-muted-foreground" />
-                <div className="text-center">
-                  <p className="font-medium text-foreground">
-                    גרור ושחרר וידאו כאן
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    או לחץ לבחירת קובץ
-                  </p>
-                </div>
-              </>
-            )}
+                </>
+              ) : videoFile ? (
+                <>
+                  <Film className="w-12 h-12 text-primary" />
+                  <div className="text-center">
+                    <p className="font-medium text-foreground">{videoFile.name}</p>
+                    <p className="text-sm text-muted-foreground">
+                      לחץ להחלפת קובץ
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Upload className="w-12 h-12 text-muted-foreground" />
+                  <div className="text-center">
+                    <p className="font-medium text-foreground">
+                      גרור ושחרר וידאו כאן
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      או לחץ לבחירת קובץ
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
+          
+          {/* URL Input Section */}
+          {!videoFile && !isAnalyzing && !isLoadingFromUrl && (
+            <div className="mt-6 pt-6 border-t border-border">
+              <div className="flex flex-col sm:flex-row gap-3">
+                <div className="flex-1">
+                  <input
+                    type="url"
+                    placeholder="או הדבק כתובת URL של וידאו..."
+                    value={videoUrlInput}
+                    onChange={(e) => setVideoUrlInput(e.target.value)}
+                    className="w-full px-4 py-2 rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        loadVideoFromUrl(videoUrlInput);
+                      }
+                    }}
+                  />
+                </div>
+                <Button 
+                  onClick={() => loadVideoFromUrl(videoUrlInput)}
+                  disabled={!videoUrlInput.trim()}
+                  variant="secondary"
+                >
+                  טען מכתובת
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                תומך בכתובות ישירות לקבצי וידאו (MP4, WebM, וכו')
+              </p>
+            </div>
+          )}
         </Card>
 
         {/* Video Info */}
@@ -820,9 +919,10 @@ const VideoFrameExtractor = () => {
                 <Label>שיטת שמירה</Label>
                 <Select
                   value={saveMethod}
-                  onValueChange={(value: "zip" | "folder") =>
-                    setSaveMethod(value)
-                  }
+                  onValueChange={(value: "zip" | "folder") => {
+                    setSaveMethod(value);
+                    setSelectedDirectory(null); // Reset selected directory when changing method
+                  }}
                 >
                   <SelectTrigger>
                     <SelectValue />
@@ -835,7 +935,9 @@ const VideoFrameExtractor = () => {
                 <p className="text-xs text-muted-foreground">
                   {saveMethod === "zip" 
                     ? "כל הפריימים יארזו לקובץ ZIP אחד" 
-                    : "הפריימים יישמרו ישירות לתיקייה שתבחר"}
+                    : selectedDirectory 
+                      ? "✓ תיקייה נבחרה - מוכן לחילוץ" 
+                      : "תתבקש לבחור תיקייה בעת הלחיצה על 'חלץ ושמור'"}
                 </p>
               </div>
 
