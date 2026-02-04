@@ -91,7 +91,7 @@ const VideoFrameExtractor = () => {
     });
   };
 
-  // WebCodecs-based fast extraction
+  // WebCodecs-based fast extraction using Web Worker for GPU optimization
   const extractFramesWebCodecs = async (
     file: File,
     videoInfo: VideoInfo,
@@ -105,262 +105,92 @@ const VideoFrameExtractor = () => {
         reject(new DOMException("Extraction cancelled", "AbortError"));
         return;
       }
-      const frames: Blob[] = [];
-      const canvas = canvasRef.current!;
-      const ctx = canvas.getContext("2d")!;
-
-      const outputWidth = Math.round(videoInfo.width * (settings.resolution / 100));
-      const outputHeight = Math.round(videoInfo.height * (settings.resolution / 100));
-      canvas.width = outputWidth;
-      canvas.height = outputHeight;
-
-      const frameIntervalMicroseconds = (1000000 / settings.fps);
-      let lastExtractedTimestamp = -frameIntervalMicroseconds;
-      const targetFrameCount = Math.floor(videoInfo.duration * settings.fps);
-      let processedFrameCount = 0;
       
-      const mimeType = `image/${settings.format}`;
-      const quality = settings.format === "png" ? undefined : settings.quality;
-
-      const pendingBlobs: Promise<void>[] = [];
-      let decoderClosed = false;
-
-      const mp4boxFile = MP4Box.createFile();
-      let videoTrackId: number | null = null;
-      let codecConfig: VideoDecoderConfig | null = null;
-
-      let rejected = false;
-      const fail = (err: unknown) => {
-        if (rejected) return;
-        rejected = true;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (mp4boxFile as any).stop?.();
-        } catch {
-          // ignore
+      const frames: Blob[] = [];
+      
+      // Create Web Worker for GPU-optimized processing
+      const worker = new Worker(
+        new URL('../workers/videoDecoder.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      
+      let workerClosed = false;
+      
+      const cleanup = () => {
+        if (!workerClosed) {
+          workerClosed = true;
+          worker.terminate();
         }
-        try {
-          decoderClosed = true;
-          decoder.close();
-        } catch {
-          // ignore
-        }
-        reject(err);
       };
-
+      
       // Listen for abort signal
       const abortHandler = () => {
-        fail(new DOMException("Extraction cancelled", "AbortError"));
+        cleanup();
+        reject(new DOMException("Extraction cancelled", "AbortError"));
       };
       signal?.addEventListener("abort", abortHandler, { once: true });
-
-      const decoder = new VideoDecoder({
-        output: (frame: VideoFrame) => {
-          const timestamp = frame.timestamp;
-          
-          // Check if we should keep this frame based on target FPS
-          if (timestamp - lastExtractedTimestamp >= frameIntervalMicroseconds * 0.9) {
-            lastExtractedTimestamp = timestamp;
-            
-            ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
-            
-            const blobPromise = new Promise<void>((resolveBlob) => {
-              canvas.toBlob(
-                (blob) => {
-                  if (blob) {
-                    frames.push(blob);
-                    processedFrameCount++;
-                    onProgress((processedFrameCount / targetFrameCount) * 100);
-                  }
-                  resolveBlob();
-                },
-                mimeType,
-                quality
-              );
-            });
-            pendingBlobs.push(blobPromise);
-          }
-          
-          frame.close();
-        },
-        error: (e) => {
-          console.error("Decoder error:", e);
-          if (!decoderClosed) {
-            fail(e);
-          }
-        },
-      });
-
-      let trackTimescale = 1;
       
-      mp4boxFile.onReady = (info: MP4Box.Movie) => {
-        const videoTrack = info.tracks.find((track: MP4Box.Track) => track.type === "video");
-        if (!videoTrack) {
-          reject(new Error("No video track found"));
-          return;
-        }
-
-        videoTrackId = videoTrack.id;
-        trackTimescale = videoTrack.timescale;
+      worker.onmessage = (e) => {
+        const data = e.data;
         
-        // Build codec string for WebCodecs
-        const codecString = videoTrack.codec;
-        
-        // Extract description (avcC/hvcC) for H.264/HEVC codecs
-        let description: Uint8Array | undefined;
-
-        const serializeMp4Box = (box: unknown): Uint8Array | undefined => {
-          if (!box) return undefined;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const b: any = box;
-          if (b instanceof Uint8Array) return b;
-          if (b?.data instanceof Uint8Array) return b.data;
-          if (b?.data instanceof ArrayBuffer) return new Uint8Array(b.data);
-          if (b?.buffer instanceof ArrayBuffer && typeof b.byteOffset === "number" && typeof b.byteLength === "number") {
-            return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-          }
-          if (b?.buffer instanceof ArrayBuffer) return new Uint8Array(b.buffer);
-
-          // Try to serialize via MP4Box's internal DataStream if available.
-          // This usually writes a full MP4 box (size+type+payload), so we strip the 8-byte header.
-          if (typeof b?.write === "function") {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const DataStreamCtor = (MP4Box as any).DataStream;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const Endianness = (MP4Box as any).Endianness;
-            if (DataStreamCtor) {
-              try {
-                const stream = new DataStreamCtor(undefined, 0, Endianness?.BIG_ENDIAN ?? 1);
-                b.write(stream);
-                const total = stream?.buffer as ArrayBuffer | undefined;
-                const endPos = typeof stream?.position === "number" ? stream.position : undefined;
-                if (total && endPos && endPos > 8) {
-                  return new Uint8Array(total.slice(8, endPos));
-                }
-                if (total && total.byteLength > 8) {
-                  return new Uint8Array(total.slice(8));
-                }
-              } catch {
-                // ignore
-              }
-            }
-          }
-
-          return undefined;
-        };
-        
-        try {
-          // Get the track box to access codec-specific configuration
-          const trak = mp4boxFile.getTrackById(videoTrackId);
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const entry = (trak as any)?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-          
-          if (entry) {
-            // For H.264 (AVC) - avcC box contains SPS/PPS
-            if (entry.avcC) {
-              description = serializeMp4Box(entry.avcC);
-            }
-            // For HEVC - hvcC box
-            else if (entry.hvcC) {
-              description = serializeMp4Box(entry.hvcC);
-            }
-          }
-        } catch (e) {
-          console.warn("Could not extract codec description:", e);
-        }
-        
-        // For AVC codecs, description is required
-        if (codecString.startsWith("avc") && !description) {
-          console.warn("No AVC description found, falling back to legacy method");
-          fail(new Error("AVC description required for WebCodecs"));
-          return;
-        }
-        
-        codecConfig = {
-          codec: codecString,
-          codedWidth: (videoTrack as { video?: { width: number; height: number } }).video?.width || videoInfo.width,
-          codedHeight: (videoTrack as { video?: { width: number; height: number } }).video?.height || videoInfo.height,
-          hardwareAcceleration: "prefer-hardware" as HardwareAcceleration,
-          description: description,
-        };
-
-        try {
-          decoder.configure(codecConfig);
-          mp4boxFile.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
-          mp4boxFile.start();
-        } catch (e) {
-          fail(e);
-        }
-      };
-
-      mp4boxFile.onSamples = (_trackId: number, _user: unknown, samples: MP4Box.Sample[]) => {
-        for (const sample of samples) {
-          try {
-            // Convert from track timescale to microseconds
-            const timestampUs = Math.floor(((sample.cts || 0) / trackTimescale) * 1000000);
-            const durationUs = Math.floor(((sample.duration || 0) / trackTimescale) * 1000000);
+        switch (data.type) {
+          case "progress":
+            onProgress(data.value);
+            break;
             
-            const chunk = new EncodedVideoChunk({
-              type: sample.is_sync ? "key" : "delta",
-              timestamp: timestampUs,
-              duration: durationUs,
-              data: sample.data!,
-            });
-            decoder.decode(chunk);
-          } catch (e) {
-            console.error("Error decoding sample:", e);
-            // If WebCodecs decoding fails (common with missing/invalid description or keyframe requirements),
-            // stop this path so the caller can fall back to the legacy extractor.
-            fail(e);
-            return;
-          }
-        }
-      };
-
-      mp4boxFile.onError = (_module: string, message: string) => {
-        console.error("MP4Box error:", message);
-        fail(new Error(message));
-      };
-
-      // Read file in chunks for better performance
-      const chunkSize = 1024 * 1024; // 1MB chunks
-      let offset = 0;
-
-      const readNextChunk = () => {
-        if (offset >= file.size) {
-          mp4boxFile.flush();
-          
-          // Wait for decoder to finish
-          decoder.flush().then(async () => {
-            decoderClosed = true;
-            decoder.close();
+          case "frame":
+            frames.push(data.blob);
+            break;
+            
+          case "complete":
             signal?.removeEventListener("abort", abortHandler);
-            await Promise.all(pendingBlobs);
+            cleanup();
             resolve(frames);
-          }).catch((e) => {
+            break;
+            
+          case "error":
             signal?.removeEventListener("abort", abortHandler);
-            reject(e);
-          });
-          return;
+            cleanup();
+            // If fallback is requested, reject with a specific error
+            if (data.fallback) {
+              reject(new Error(data.error || "Worker error - fallback required"));
+            } else {
+              reject(new Error(data.error || "Unknown worker error"));
+            }
+            break;
         }
-
-        const slice = file.slice(offset, offset + chunkSize);
-        const reader = new FileReader();
-        
-        reader.onload = () => {
-          const buffer = reader.result as ArrayBuffer;
-          const mp4Buffer = buffer as MP4Box.MP4BoxBuffer;
-          mp4Buffer.fileStart = offset;
-          mp4boxFile.appendBuffer(mp4Buffer);
-          offset += chunkSize;
-          readNextChunk();
-        };
-        
-        reader.onerror = () => reject(new Error("Failed to read file"));
-        reader.readAsArrayBuffer(slice);
       };
-
-      readNextChunk();
+      
+      worker.onerror = (error) => {
+        signal?.removeEventListener("abort", abortHandler);
+        cleanup();
+        reject(new Error(`Worker error: ${error.message}`));
+      };
+      
+      // Read file as ArrayBuffer and send to worker
+      const reader = new FileReader();
+      reader.onload = () => {
+        const arrayBuffer = reader.result as ArrayBuffer;
+        
+        // Transfer the ArrayBuffer to the worker for zero-copy performance
+        worker.postMessage(
+          {
+            type: "start",
+            file: arrayBuffer,
+            settings,
+            videoInfo,
+          },
+          [arrayBuffer] // Transfer ownership
+        );
+      };
+      
+      reader.onerror = () => {
+        signal?.removeEventListener("abort", abortHandler);
+        cleanup();
+        reject(new Error("Failed to read video file"));
+      };
+      
+      reader.readAsArrayBuffer(file);
     });
   };
 
