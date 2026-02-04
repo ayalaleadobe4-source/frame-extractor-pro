@@ -1,85 +1,109 @@
 
+# אופטימיזציית GPU - ניצול מלא של כרטיס המסך
 
-# תיקון: הוספת Description עבור H.264/AVC ב-WebCodecs
+## מה הבעיה?
 
-## הבעיה
+הקוד הנוכחי עובד ב-100% אבל לא מנצל את ה-GPU בצורה מקסימלית בגלל:
 
-השגיאה "A key frame is required after configure() or flush()" מופיעה כי עבור קודקים מסוג H.264 (AVC), ה-VideoDecoder דורש שדה `description` בקונפיגורציה. שדה זה מכיל את המידע ההכרחי (SPS/PPS) לאתחול הדיקודר.
+1. **אין ניהול Backpressure** - אנחנו מזינים chunks בלי לבדוק אם ה-decoder מוכן לקבל עוד
+2. **עבודה ב-Main Thread** - כל העיבוד קורה ב-thread הראשי
+3. **Canvas רגיל במקום OffscreenCanvas** - גורם לחסימות בעיבוד
 
 ## הפתרון
 
-הוספת חילוץ ה-Description מה-MP4Box והעברתו לקונפיגורציית ה-Decoder.
+### שלב 1: ניהול Backpressure (עיקרי)
+שמירה על תור של 10-20 chunks בזיכרון ה-decoder כדי שה-GPU יעבוד ברציפות:
 
-## שלבי המימוש
+```text
+לפני:
+chunks → decoder → GPU (idle 90% מהזמן)
 
-### שלב 1: חילוץ ה-Description מ-MP4Box
+אחרי:
+chunks → [buffer 15-20] → decoder → GPU (עובד ברציפות)
+```
 
-ב-`mp4boxFile.onReady`, נחלץ את ה-description מה-track:
+### שלב 2: Web Worker לעיבוד
+העברת הפענוח ל-Worker נפרד כדי שה-Main Thread לא יחסום את ה-GPU:
 
+```text
+Main Thread              Worker Thread
+─────────────           ──────────────
+File I/O          →     VideoDecoder + GPU
+UI updates        ←     Processed frames
+```
+
+### שלב 3: OffscreenCanvas
+שימוש ב-OffscreenCanvas בתוך ה-Worker לעיבוד מהיר יותר של הפריימים.
+
+---
+
+## פרטים טכניים
+
+### קבצים חדשים:
+- `src/workers/videoDecoder.worker.ts` - Worker לפענוח הווידאו
+
+### שינויים ב-`src/components/VideoFrameExtractor.tsx`:
+
+#### 1. הוספת Backpressure ב-onSamples:
 ```typescript
-mp4boxFile.onReady = (info: MP4Box.Movie) => {
-  const videoTrack = info.tracks.find((track) => track.type === "video");
-  
-  // Get the description (extradata) for H.264/HEVC
-  let description: Uint8Array | undefined;
-  
-  // MP4Box stores codec-specific data in the track
-  const trak = mp4boxFile.getTrackById(videoTrack.id);
-  if (trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]) {
-    const entry = trak.mdia.minf.stbl.stsd.entries[0];
-    // For H.264 - avcC box
-    if (entry.avcC) {
-      description = new Uint8Array(entry.avcC.data || entry.avcC);
+mp4boxFile.onSamples = async (_trackId, _user, samples) => {
+  for (const sample of samples) {
+    // Wait for decoder to have capacity (keep 15-20 in queue)
+    while (decoder.decodeQueueSize > 15) {
+      await new Promise(r => 
+        decoder.addEventListener('dequeue', r, { once: true })
+      );
     }
-    // For HEVC - hvcC box
-    else if (entry.hvcC) {
-      description = new Uint8Array(entry.hvcC.data || entry.hvcC);
-    }
+    
+    const chunk = new EncodedVideoChunk({...});
+    decoder.decode(chunk);
   }
-  
-  codecConfig = {
-    codec: videoTrack.codec,
-    codedWidth: videoTrack.video?.width,
-    codedHeight: videoTrack.video?.height,
-    hardwareAcceleration: "prefer-hardware",
-    description: description, // ✅ הוספת ה-description
-  };
 };
 ```
 
-### שלב 2: שימוש ב-getTrackById של MP4Box
-
-MP4Box מספק את פונקציית `getTrackById` שמחזירה את כל המידע של ה-track, כולל ה-codec configuration box (avcC/hvcC).
-
-### שלב 3: טיפול בפורמטים שונים
-
-```text
-פורמט הווידאו -> Box שמכיל Description
-───────────────────────────────────────
-H.264 (AVC)  -> avcC (AVC Configuration Box)
-H.265 (HEVC) -> hvcC (HEVC Configuration Box)  
-VP9          -> vpcC (VP9 Configuration Box)
-AV1          -> av1C (AV1 Configuration Box)
-```
-
-### שלב 4: Fallback אם אין Description
-
-אם לא מצליחים לחלץ את ה-description, נעבור אוטומטית לשיטת ה-Legacy:
-
+#### 2. הוספת Web Worker:
 ```typescript
-if (codecString.startsWith("avc") && !description) {
-  console.warn("No AVC description found, falling back to legacy");
-  throw new Error("AVC description required");
-}
+// Worker setup
+const worker = new Worker(
+  new URL('../workers/videoDecoder.worker.ts', import.meta.url),
+  { type: 'module' }
+);
+
+// Send file and settings to worker
+worker.postMessage({ file, settings, videoInfo });
+
+// Receive processed frames
+worker.onmessage = (e) => {
+  if (e.data.type === 'frame') {
+    frames.push(e.data.blob);
+  } else if (e.data.type === 'progress') {
+    onProgress(e.data.value);
+  }
+};
 ```
 
-## קובץ לעריכה
+#### 3. OffscreenCanvas בתוך ה-Worker:
+```typescript
+// In worker
+const canvas = new OffscreenCanvas(width, height);
+const ctx = canvas.getContext('2d');
 
-`src/components/VideoFrameExtractor.tsx` - עדכון פונקציית `extractFramesWebCodecs`
+// Draw frame directly on GPU-backed canvas
+ctx.drawImage(frame, 0, 0);
+const blob = await canvas.convertToBlob({ type: mimeType, quality });
+```
+
+---
 
 ## תוצאה צפויה
 
-- חילוץ מהיר עם GPU עבור קבצי H.264/AVC
-- ללא שגיאות "key frame required"
-- Fallback אוטומטי לשיטה הישנה אם יש בעיה
+| מדד | לפני | אחרי |
+|-----|------|------|
+| ניצול GPU | ~8% | 60-90%+ |
+| מהירות חילוץ | ~10 FPS | ~100+ FPS |
+| תגובתיות UI | לפעמים קופא | חלקה |
 
+## הערות
+- Adobe Media Encoder משתמש בטכניקות דומות + אופטימיזציות native
+- הביצועים תלויים גם בסוג הקודק (H.264 מהיר יותר מ-HEVC על רוב ה-GPUs)
+- חלק מהשיפור יהיה מורגש יותר בקבצים ארוכים/גדולים
