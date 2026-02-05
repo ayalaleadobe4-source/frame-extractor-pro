@@ -104,7 +104,8 @@ const VideoFrameExtractor = () => {
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
     onProgress: (progress: number, currentFrame: number, totalFrames: number) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onFrameReady?: (blob: Blob, frameIndex: number) => Promise<void>
   ): Promise<Blob[]> => {
     return new Promise((resolve, reject) => {
       // Check for cancellation at start
@@ -171,12 +172,24 @@ const VideoFrameExtractor = () => {
             
             ctx.drawImage(frame, 0, 0, outputWidth, outputHeight);
             
-            const blobPromise = new Promise<void>((resolveBlob) => {
+            const blobPromise = new Promise<void>(async (resolveBlob) => {
               canvas.toBlob(
-                (blob) => {
+                async (blob) => {
                   if (blob) {
-                    frames.push(blob);
+                    const frameIdx = processedFrameCount;
                     processedFrameCount++;
+                    
+                    // If streaming to folder, save immediately
+                    if (onFrameReady) {
+                      try {
+                        await onFrameReady(blob, frameIdx);
+                      } catch (e) {
+                        console.error("Error saving frame:", e);
+                      }
+                    } else {
+                      frames.push(blob);
+                    }
+                    
                     onProgress((processedFrameCount / targetFrameCount) * 100, processedFrameCount, targetFrameCount);
                   }
                   resolveBlob();
@@ -376,7 +389,8 @@ const VideoFrameExtractor = () => {
     videoInfo: VideoInfo,
     settings: ExtractionSettings,
     onProgress: (progress: number, currentFrame: number, totalFrames: number) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onFrameReady?: (blob: Blob, frameIndex: number) => Promise<void>
   ): Promise<Blob[]> => {
     const video = videoRef.current!;
     const canvas = canvasRef.current!;
@@ -419,7 +433,13 @@ const VideoFrameExtractor = () => {
         );
       });
 
-      frames.push(blob);
+      // If streaming to folder, save immediately
+      if (onFrameReady) {
+        await onFrameReady(blob, i);
+      } else {
+        frames.push(blob);
+      }
+      
       onProgress(((i + 1) / framesToExtract) * 100, i + 1, framesToExtract);
     }
 
@@ -599,10 +619,39 @@ const VideoFrameExtractor = () => {
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
 
+    // For folder save, create directory handle upfront
+    let framesDir: FileSystemDirectoryHandle | null = null;
+    if (saveMethod === "folder" && selectedDirectory) {
+      try {
+        const framesFolderName = `frames_${videoFile?.name.split(".")[0] || "video"}`;
+        framesDir = await selectedDirectory.getDirectoryHandle(framesFolderName, { create: true });
+      } catch (err) {
+        console.error("Error creating frames directory:", err);
+        alert("שגיאה ביצירת תיקיית הפריימים");
+        setIsExtracting(false);
+        return;
+      }
+    }
+
     const onProgress = (progress: number, currentFrame: number, totalFrames: number) => {
       setExtractionProgress(Math.min(progress, 100));
-      setStatusMessage(`חולצו ${currentFrame.toLocaleString()} מתוך ${totalFrames.toLocaleString()} פריימים`);
+      if (saveMethod === "folder") {
+        setStatusMessage(`חולצו ונשמרו ${currentFrame.toLocaleString()} מתוך ${totalFrames.toLocaleString()} פריימים`);
+      } else {
+        setStatusMessage(`חולצו ${currentFrame.toLocaleString()} מתוך ${totalFrames.toLocaleString()} פריימים`);
+      }
     };
+
+    // Callback to save each frame directly to folder during extraction
+    const onFrameReady = saveMethod === "folder" && framesDir ? async (blob: Blob, frameIndex: number) => {
+      const paddedIndex = String(frameIndex + 1).padStart(5, "0");
+      const fileName = `frame_${paddedIndex}.${settings.format}`;
+      
+      const fileHandle = await framesDir!.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+    } : undefined;
 
     try {
       let frames: Blob[];
@@ -613,17 +662,17 @@ const VideoFrameExtractor = () => {
       if (useWebCodecs && isMp4) {
         setExtractionMethod("WebCodecs (GPU מואץ)");
         try {
-          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress, signal);
+          frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress, signal, onFrameReady);
         } catch (e) {
           if (signal.aborted) throw e;
           console.warn("WebCodecs extraction failed, falling back to legacy:", e);
           setExtractionMethod("Legacy (CPU)");
           setStatusMessage("קורא את הקובץ...");
-          frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal);
+          frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal, onFrameReady);
         }
       } else {
         setExtractionMethod("Legacy (CPU)");
-        frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal);
+        frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal, onFrameReady);
       }
 
       if (!signal.aborted) {
@@ -635,13 +684,8 @@ const VideoFrameExtractor = () => {
           await new Promise(resolve => setTimeout(resolve, 300));
           setStatusMessage("הושלם בהצלחה!");
         } else {
-          // For folder save, save directly
-          setIsCreatingOutput(true);
-          setStatusMessage("שומר קבצים לתיקייה...");
-          await saveFramesToFolder(frames);
+          // Frames were already saved during extraction
           setStatusMessage("הקבצים נשמרו בהצלחה!");
-          setIsCreatingOutput(false);
-          // Clear frames to save memory since they're already saved
           setExtractedFrames([]);
         }
       }
