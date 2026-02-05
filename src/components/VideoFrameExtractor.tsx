@@ -1,11 +1,12 @@
 import { useState, useRef, useCallback } from "react";
+import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Label } from "@/components/ui/label";
-import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap, X } from "lucide-react";
+import { Upload, Download, Film, Settings, Image as ImageIcon, Loader2, Zap, X, Video } from "lucide-react";
 import JSZip from "jszip";
 import * as MP4Box from "mp4box";
 
@@ -737,6 +738,13 @@ const VideoFrameExtractor = () => {
                 : "WebCodecs לא נתמך - שימוש בשיטה רגילה"}
             </div>
           )}
+          <Link
+            to="/convert"
+            className="inline-flex items-center gap-2 text-primary hover:text-primary/80 transition-colors"
+          >
+            <Video className="w-4 h-4" />
+            <span>המרת וידאו</span>
+          </Link>
         </div>
 
         {/* Upload Zone */}
