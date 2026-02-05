@@ -534,8 +534,24 @@ const VideoFrameExtractor = () => {
     }
   };
 
+  // Check if running inside an iframe (preview mode)
+  const isInIframe = () => {
+    try {
+      return window.self !== window.top;
+    } catch {
+      return true;
+    }
+  };
+
   const selectSaveFolder = async () => {
     try {
+      // Check if running in iframe - showDirectoryPicker doesn't work in iframes
+      if (isInIframe()) {
+        alert("שמירה ישירה לתיקייה לא זמינה בתצוגה המקדימה.\n\nכדי להשתמש באפשרות זו, פתח את האפליקציה בחלון חדש (לחץ על כפתור 'פתח בחלון חדש' בפינה הימנית העליונה).\n\nלחלופין, השתמש באפשרות הורדת ZIP.");
+        setSaveMethod("zip");
+        return false;
+      }
+
       // Check if File System Access API is supported
       if (!('showDirectoryPicker' in window)) {
         alert("הדפדפן שלך לא תומך בשמירה ישירה לתיקייה. אנא השתמש באפשרות ZIP.");
@@ -550,6 +566,10 @@ const VideoFrameExtractor = () => {
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
         console.log("User cancelled folder selection");
+        return false;
+      } else if ((err as Error).name === 'SecurityError') {
+        alert("שמירה ישירה לתיקייה לא זמינה בתצוגה המקדימה.\n\nכדי להשתמש באפשרות זו, פתח את האפליקציה בחלון חדש.\n\nלחלופין, השתמש באפשרות הורדת ZIP.");
+        setSaveMethod("zip");
         return false;
       } else {
         console.error("Error selecting folder:", err);
