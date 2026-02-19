@@ -1,13 +1,7 @@
-import { hydrateRoot, createRoot } from "react-dom/client";
+import { ViteSSG } from 'vite-ssg/single-page';
 import App from "./App.tsx";
 import "./index.css";
 
-const container = document.getElementById("root")!;
-
-// בודק אם קובץ ה-HTML כבר מכיל תוכן (כלומר עבר פרירנדר)
-if (container.hasChildNodes()) {
-  hydrateRoot(container, <App />);
-} else {
-  // אם אין תוכן (למשל כשאתה מריץ את האתר בסביבת הפיתוח שלך), עובד כרגיל
-  createRoot(container).render(<App />);
-}
+// הפונקציה הזו מחליפה את ה-createRoot הרגיל. 
+// היא תדאג לעשות רינדור בשרת בזמן הבנייה, ו-Hydration בדפדפן אצל הלקוח.
+export const createApp = ViteSSG(App);
