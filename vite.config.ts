@@ -12,10 +12,22 @@ export default defineConfig(({ mode }) => ({
       overlay: false,
     },
   },
-  plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
+  plugins: [
+    react(),
+    mode === "development" && componentTagger(),
+  ].filter(Boolean),
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  // הגדרות עבור הפרירנדר (SSG)
+  ssgOptions: {
+    script: 'async', // טעינת סקריפטים בצורה אסינכרונית לביצועים טובים יותר
+    formatting: 'minify', // כיווץ ה-HTML שנוצר
+    includedRoutes() {
+      // כאן אנחנו מגדירים אילו נתיבים לרנדר. כרגע רק את דף הבית.
+      return ['/'];
     },
   },
 }));
