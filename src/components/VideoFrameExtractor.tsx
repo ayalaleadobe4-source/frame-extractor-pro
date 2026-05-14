@@ -563,38 +563,60 @@ const VideoFrameExtractor = () => {
     }
   };
 
-  const selectSaveFolder = async () => {
+  const ensureDirectoryWritable = async (dirHandle: FileSystemDirectoryHandle) => {
+    const writableHandle = dirHandle as FileSystemDirectoryHandle & {
+      queryPermission?: (descriptor?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>;
+      requestPermission?: (descriptor?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>;
+    };
+
+    if (!writableHandle.queryPermission || !writableHandle.requestPermission) {
+      return true;
+    }
+
+    const permission = await writableHandle.queryPermission({ mode: "readwrite" });
+    if (permission === "granted") return true;
+
+    const requestedPermission = await writableHandle.requestPermission({ mode: "readwrite" });
+    return requestedPermission === "granted";
+  };
+
+  const selectSaveFolder = async (): Promise<FileSystemDirectoryHandle | null> => {
     try {
       // Check if running in iframe - showDirectoryPicker doesn't work in iframes
       if (isInIframe()) {
         alert("שמירה ישירה לתיקייה לא זמינה בתצוגה המקדימה.\n\nכדי להשתמש באפשרות זו, פתח את האפליקציה בחלון חדש (לחץ על כפתור 'פתח בחלון חדש' בפינה הימנית העליונה).\n\nלחלופין, השתמש באפשרות הורדת ZIP.");
         setSaveMethod("zip");
-        return false;
+        return null;
       }
 
       // Check if File System Access API is supported
       if (!('showDirectoryPicker' in window)) {
         alert("הדפדפן שלך לא תומך בשמירה ישירה לתיקייה. אנא השתמש באפשרות ZIP.");
         setSaveMethod("zip");
-        return false;
+        return null;
       }
 
       // Request directory access
       const dirHandle = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker();
+      const hasWritePermission = await ensureDirectoryWritable(dirHandle);
+      if (!hasWritePermission) {
+        alert("לא ניתנה הרשאת כתיבה לתיקייה. בחר תיקייה ואשר הרשאת כתיבה כדי לשמור את הפריימים.");
+        return null;
+      }
       setSelectedDirectory(dirHandle);
-      return true;
+      return dirHandle;
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
         console.log("User cancelled folder selection");
-        return false;
+        return null;
       } else if ((err as Error).name === 'SecurityError') {
         alert("שמירה ישירה לתיקייה לא זמינה בתצוגה המקדימה.\n\nכדי להשתמש באפשרות זו, פתח את האפליקציה בחלון חדש.\n\nלחלופין, השתמש באפשרות הורדת ZIP.");
         setSaveMethod("zip");
-        return false;
+        return null;
       } else {
         console.error("Error selecting folder:", err);
         alert("שגיאה בבחירת התיקייה");
-        return false;
+        return null;
       }
     }
   };
@@ -602,10 +624,23 @@ const VideoFrameExtractor = () => {
   const extractFrames = async () => {
     if (!videoFile || !videoInfo) return;
 
+    let targetDirectory = selectedDirectory;
+
     // If folder method is selected, first select the folder
-    if (saveMethod === "folder" && !selectedDirectory) {
-      const folderSelected = await selectSaveFolder();
-      if (!folderSelected) {
+    if (saveMethod === "folder") {
+      if (targetDirectory) {
+        const hasWritePermission = await ensureDirectoryWritable(targetDirectory);
+        if (!hasWritePermission) {
+          targetDirectory = null;
+          setSelectedDirectory(null);
+        }
+      }
+
+      if (!targetDirectory) {
+        targetDirectory = await selectSaveFolder();
+      }
+
+      if (!targetDirectory) {
         return; // User cancelled or error
       }
     }
@@ -621,10 +656,10 @@ const VideoFrameExtractor = () => {
 
     // For folder save, create directory handle upfront
     let framesDir: FileSystemDirectoryHandle | null = null;
-    if (saveMethod === "folder" && selectedDirectory) {
+    if (saveMethod === "folder" && targetDirectory) {
       try {
         const framesFolderName = `frames_${videoFile?.name.split(".")[0] || "video"}`;
-        framesDir = await selectedDirectory.getDirectoryHandle(framesFolderName, { create: true });
+        framesDir = await targetDirectory.getDirectoryHandle(framesFolderName, { create: true });
       } catch (err) {
         console.error("Error creating frames directory:", err);
         alert("שגיאה ביצירת תיקיית הפריימים");
@@ -656,10 +691,12 @@ const VideoFrameExtractor = () => {
     try {
       let frames: Blob[];
       
-      // Try WebCodecs first for MP4 files
+      // Try WebCodecs first for MP4 files. Folder export uses the sequential path so
+      // large videos are written one frame at a time instead of opening many file writers in parallel.
       const isMp4 = videoFile.type === "video/mp4" || videoFile.name.toLowerCase().endsWith(".mp4");
+      const shouldUseWebCodecs = useWebCodecs && isMp4 && saveMethod !== "folder";
       
-      if (useWebCodecs && isMp4) {
+      if (shouldUseWebCodecs) {
         setExtractionMethod("WebCodecs (GPU מואץ)");
         try {
           frames = await extractFramesWebCodecs(videoFile, videoInfo, settings, onProgress, signal, onFrameReady);
@@ -671,7 +708,7 @@ const VideoFrameExtractor = () => {
           frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal, onFrameReady);
         }
       } else {
-        setExtractionMethod("Legacy (CPU)");
+        setExtractionMethod(saveMethod === "folder" ? "שמירה רציפה לתיקייה" : "Legacy (CPU)");
         frames = await extractFramesLegacy(videoInfo, settings, onProgress, signal, onFrameReady);
       }
 
