@@ -586,6 +586,43 @@ const VideoFrameExtractor = () => {
     return requestedPermission === "granted";
   };
 
+  const safeFileNamePart = (name: string) =>
+    name.replace(/\.[^/.]+$/, "").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video";
+
+  const createUniqueFramesDirectory = async (
+    targetDirectory: FileSystemDirectoryHandle,
+    sourceFileName: string
+  ) => {
+    const baseName = `frames_${safeFileNamePart(sourceFileName)}`;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return targetDirectory.getDirectoryHandle(`${baseName}_${stamp}`, { create: true });
+  };
+
+  const writeBlobToFile = async (
+    directory: FileSystemDirectoryHandle,
+    fileName: string,
+    blob: Blob,
+    signal?: AbortSignal
+  ) => {
+    if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+    const fileHandle = await directory.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable({ keepExistingData: false });
+
+    try {
+      if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+      await writable.write(blob);
+      if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+      await writable.close();
+    } catch (error) {
+      try {
+        await writable.abort();
+      } catch {
+        // ignore abort errors
+      }
+      throw error;
+    }
+  };
+
   const selectSaveFolder = async (): Promise<FileSystemDirectoryHandle | null> => {
     try {
       // Check if running in iframe - showDirectoryPicker doesn't work in iframes
