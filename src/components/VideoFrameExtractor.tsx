@@ -49,6 +49,11 @@ const VideoFrameExtractor = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const progressUiRef = useRef({
+    lastProgressUpdate: 0,
+    lastSavedBytesUpdate: 0,
+    savedBytes: 0,
+  });
   const [isCancelling, setIsCancelling] = useState(false);
   const [saveMethod, setSaveMethod] = useState<"zip" | "folder">("zip");
   const [savedBytes, setSavedBytes] = useState<number>(0);
@@ -132,11 +137,11 @@ const VideoFrameExtractor = () => {
       const quality = settings.format === "png" ? undefined : settings.quality;
 
       const pendingBlobs: Promise<void>[] = [];
-      let decoderClosed = false;
-
       const mp4boxFile = MP4Box.createFile();
       let videoTrackId: number | null = null;
       let codecConfig: VideoDecoderConfig | null = null;
+      let decoder: VideoDecoder | null = null;
+      let decoderClosed = false;
 
       let rejected = false;
       const fail = (err: unknown) => {
@@ -150,7 +155,7 @@ const VideoFrameExtractor = () => {
         }
         try {
           decoderClosed = true;
-          decoder.close();
+          decoder?.close();
         } catch {
           // ignore
         }
@@ -163,7 +168,7 @@ const VideoFrameExtractor = () => {
       };
       signal?.addEventListener("abort", abortHandler, { once: true });
 
-      const decoder = new VideoDecoder({
+      decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
           const timestamp = frame.timestamp;
           
@@ -581,6 +586,43 @@ const VideoFrameExtractor = () => {
     return requestedPermission === "granted";
   };
 
+  const safeFileNamePart = (name: string) =>
+    name.replace(/\.[^/.]+$/, "").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "video";
+
+  const createUniqueFramesDirectory = async (
+    targetDirectory: FileSystemDirectoryHandle,
+    sourceFileName: string
+  ) => {
+    const baseName = `frames_${safeFileNamePart(sourceFileName)}`;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return targetDirectory.getDirectoryHandle(`${baseName}_${stamp}`, { create: true });
+  };
+
+  const writeBlobToFile = async (
+    directory: FileSystemDirectoryHandle,
+    fileName: string,
+    blob: Blob,
+    signal?: AbortSignal
+  ) => {
+    if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+    const fileHandle = await directory.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable({ keepExistingData: false });
+
+    try {
+      if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+      await writable.write(blob);
+      if (signal?.aborted) throw new DOMException("Extraction cancelled", "AbortError");
+      await writable.close();
+    } catch (error) {
+      try {
+        await writable.abort();
+      } catch {
+        // ignore abort errors
+      }
+      throw error;
+    }
+  };
+
   const selectSaveFolder = async (): Promise<FileSystemDirectoryHandle | null> => {
     try {
       // Check if running in iframe - showDirectoryPicker doesn't work in iframes
@@ -651,6 +693,11 @@ const VideoFrameExtractor = () => {
     setExtractedFrames([]);
     setExtractionProgress(0);
     setSavedBytes(0);
+    progressUiRef.current = {
+      lastProgressUpdate: 0,
+      lastSavedBytesUpdate: 0,
+      savedBytes: 0,
+    };
     setStatusMessage("קורא את הקובץ...");
 
     abortControllerRef.current = new AbortController();
@@ -660,8 +707,7 @@ const VideoFrameExtractor = () => {
     let framesDir: FileSystemDirectoryHandle | null = null;
     if (saveMethod === "folder" && targetDirectory) {
       try {
-        const framesFolderName = `frames_${videoFile?.name.split(".")[0] || "video"}`;
-        framesDir = await targetDirectory.getDirectoryHandle(framesFolderName, { create: true });
+        framesDir = await createUniqueFramesDirectory(targetDirectory, videoFile.name);
       } catch (err) {
         console.error("Error creating frames directory:", err);
         alert("שגיאה ביצירת תיקיית הפריימים");
@@ -671,6 +717,11 @@ const VideoFrameExtractor = () => {
     }
 
     const onProgress = (progress: number, currentFrame: number, totalFrames: number) => {
+      const now = performance.now();
+      const shouldUpdate = now - progressUiRef.current.lastProgressUpdate > 120 || currentFrame >= totalFrames;
+      if (!shouldUpdate) return;
+
+      progressUiRef.current.lastProgressUpdate = now;
       setExtractionProgress(Math.min(progress, 100));
       if (saveMethod === "folder") {
         setStatusMessage(`חולצו ונשמרו ${currentFrame.toLocaleString()} מתוך ${totalFrames.toLocaleString()} פריימים`);
@@ -684,11 +735,14 @@ const VideoFrameExtractor = () => {
       const paddedIndex = String(frameIndex + 1).padStart(5, "0");
       const fileName = `frame_${paddedIndex}.${settings.format}`;
       
-      const fileHandle = await framesDir!.getFileHandle(fileName, { create: true });
-      const writable = await fileHandle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      setSavedBytes((prev) => prev + blob.size);
+      await writeBlobToFile(framesDir!, fileName, blob, signal);
+      progressUiRef.current.savedBytes += blob.size;
+
+      const now = performance.now();
+      if (now - progressUiRef.current.lastSavedBytesUpdate > 250) {
+        progressUiRef.current.lastSavedBytesUpdate = now;
+        setSavedBytes(progressUiRef.current.savedBytes);
+      }
     } : undefined;
 
     try {
