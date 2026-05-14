@@ -137,11 +137,11 @@ const VideoFrameExtractor = () => {
       const quality = settings.format === "png" ? undefined : settings.quality;
 
       const pendingBlobs: Promise<void>[] = [];
-      let decoderClosed = false;
-
       const mp4boxFile = MP4Box.createFile();
       let videoTrackId: number | null = null;
       let codecConfig: VideoDecoderConfig | null = null;
+      let decoder: VideoDecoder | null = null;
+      let decoderClosed = false;
 
       let rejected = false;
       const fail = (err: unknown) => {
@@ -155,7 +155,7 @@ const VideoFrameExtractor = () => {
         }
         try {
           decoderClosed = true;
-          decoder.close();
+          decoder?.close();
         } catch {
           // ignore
         }
@@ -168,7 +168,7 @@ const VideoFrameExtractor = () => {
       };
       signal?.addEventListener("abort", abortHandler, { once: true });
 
-      const decoder = new VideoDecoder({
+      decoder = new VideoDecoder({
         output: (frame: VideoFrame) => {
           const timestamp = frame.timestamp;
           
