@@ -49,6 +49,11 @@ const VideoFrameExtractor = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const progressUiRef = useRef({
+    lastProgressUpdate: 0,
+    lastSavedBytesUpdate: 0,
+    savedBytes: 0,
+  });
   const [isCancelling, setIsCancelling] = useState(false);
   const [saveMethod, setSaveMethod] = useState<"zip" | "folder">("zip");
   const [savedBytes, setSavedBytes] = useState<number>(0);
