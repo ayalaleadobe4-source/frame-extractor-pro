@@ -51,6 +51,7 @@ const VideoFrameExtractor = () => {
   const abortControllerRef = useRef<AbortController | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
   const [saveMethod, setSaveMethod] = useState<"zip" | "folder">("zip");
+  const [savedBytes, setSavedBytes] = useState<number>(0);
   const [isCreatingOutput, setIsCreatingOutput] = useState(false);
   const [selectedDirectory, setSelectedDirectory] = useState<FileSystemDirectoryHandle | null>(null);
   const [videoUrlInput, setVideoUrlInput] = useState<string>("");
@@ -649,6 +650,7 @@ const VideoFrameExtractor = () => {
     setIsCancelling(false);
     setExtractedFrames([]);
     setExtractionProgress(0);
+    setSavedBytes(0);
     setStatusMessage("קורא את הקובץ...");
 
     abortControllerRef.current = new AbortController();
@@ -686,6 +688,7 @@ const VideoFrameExtractor = () => {
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
+      setSavedBytes((prev) => prev + blob.size);
     } : undefined;
 
     try {
@@ -816,6 +819,13 @@ const VideoFrameExtractor = () => {
   const estimatedFrames = videoInfo
     ? Math.floor(videoInfo.duration * settings.fps)
     : 0;
+
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
 
   return (
     <div className="min-h-screen bg-background p-4 md:p-8">
@@ -1122,6 +1132,13 @@ const VideoFrameExtractor = () => {
                     </div>
                   )}
                   <Progress value={extractionProgress} className="progress-bar" />
+                  {saveMethod === "folder" && savedBytes > 0 && (
+                    <div className="flex items-center justify-center gap-2 text-xs px-3 py-2 rounded-md bg-success/10 text-success border border-success/20">
+                      <span>💾 נחסכו</span>
+                      <span className="font-mono font-bold">{formatBytes(savedBytes)}</span>
+                      <span>זיכרון RAM (נכתב ישירות לדיסק)</span>
+                    </div>
+                  )}
                 </div>
               )}
 
