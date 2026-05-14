@@ -693,6 +693,11 @@ const VideoFrameExtractor = () => {
     setExtractedFrames([]);
     setExtractionProgress(0);
     setSavedBytes(0);
+    progressUiRef.current = {
+      lastProgressUpdate: 0,
+      lastSavedBytesUpdate: 0,
+      savedBytes: 0,
+    };
     setStatusMessage("קורא את הקובץ...");
 
     abortControllerRef.current = new AbortController();
@@ -702,8 +707,7 @@ const VideoFrameExtractor = () => {
     let framesDir: FileSystemDirectoryHandle | null = null;
     if (saveMethod === "folder" && targetDirectory) {
       try {
-        const framesFolderName = `frames_${videoFile?.name.split(".")[0] || "video"}`;
-        framesDir = await targetDirectory.getDirectoryHandle(framesFolderName, { create: true });
+        framesDir = await createUniqueFramesDirectory(targetDirectory, videoFile.name);
       } catch (err) {
         console.error("Error creating frames directory:", err);
         alert("שגיאה ביצירת תיקיית הפריימים");
@@ -713,6 +717,11 @@ const VideoFrameExtractor = () => {
     }
 
     const onProgress = (progress: number, currentFrame: number, totalFrames: number) => {
+      const now = performance.now();
+      const shouldUpdate = now - progressUiRef.current.lastProgressUpdate > 120 || currentFrame >= totalFrames;
+      if (!shouldUpdate) return;
+
+      progressUiRef.current.lastProgressUpdate = now;
       setExtractionProgress(Math.min(progress, 100));
       if (saveMethod === "folder") {
         setStatusMessage(`חולצו ונשמרו ${currentFrame.toLocaleString()} מתוך ${totalFrames.toLocaleString()} פריימים`);
@@ -726,11 +735,14 @@ const VideoFrameExtractor = () => {
       const paddedIndex = String(frameIndex + 1).padStart(5, "0");
       const fileName = `frame_${paddedIndex}.${settings.format}`;
       
-      const fileHandle = await framesDir!.getFileHandle(fileName, { create: true });
-      const writable = await fileHandle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      setSavedBytes((prev) => prev + blob.size);
+      await writeBlobToFile(framesDir!, fileName, blob, signal);
+      progressUiRef.current.savedBytes += blob.size;
+
+      const now = performance.now();
+      if (now - progressUiRef.current.lastSavedBytesUpdate > 250) {
+        progressUiRef.current.lastSavedBytesUpdate = now;
+        setSavedBytes(progressUiRef.current.savedBytes);
+      }
     } : undefined;
 
     try {
