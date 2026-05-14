@@ -650,6 +650,7 @@ const VideoFrameExtractor = () => {
     setIsCancelling(false);
     setExtractedFrames([]);
     setExtractionProgress(0);
+    setSavedBytes(0);
     setStatusMessage("קורא את הקובץ...");
 
     abortControllerRef.current = new AbortController();
@@ -687,6 +688,7 @@ const VideoFrameExtractor = () => {
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
+      setSavedBytes((prev) => prev + blob.size);
     } : undefined;
 
     try {
